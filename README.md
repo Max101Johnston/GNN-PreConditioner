@@ -69,3 +69,5 @@ numerical adapter reuses the existing project's audited replay and RAS helpers
 via a configured dependency snapshot; a public release must document or package
 those dependencies with their provenance. A distribution licence has not yet
 been selected.
+
+The bridge preserves HYPRE special-F rows with no outgoing strong connections. They remain fine-smoother responsibilities. The gate independently checks these rows are also empty in the effective base; it does not waive coverage for other F rows.

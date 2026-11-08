@@ -23,6 +23,12 @@ def numerical_smoke(config, p, legacy, bridge):
     lo, hi = owners[p.rank:p.rank+2]
     matrix = sp.diags([np.full(n-3, -.5), np.full(n, 2.), np.full(n-3, -.5)],
                       [-3, 0, 3], format="csr")
+    if p.size > 2:
+        matrix = matrix.tolil()
+        for row in range(3, 6):
+            matrix.rows[row] = [row]
+            matrix.data[row] = [2.]
+        matrix = matrix.tocsr()
     distributed = legacy.DistributedSparse(p, matrix[lo:hi], owners, owners)
     native = np.arange(lo, hi)
     selected = ((native//3) % 3 == 0) | (native//3 == p.size-1)
@@ -30,6 +36,7 @@ def numerical_smoke(config, p, legacy, bridge):
                   selected, np.zeros(3, dtype=bool), config["interpolation"])
     assert level.stats["uncovered_free_rows"] == level.stats["empty_free_rows"] == 0
     assert level.stats["injection_error"] == 0
+    assert level.stats["special_fine_rows"] == (3 if p.size > 2 else 0)
     start, stop = level.owners[p.rank:p.rank+2]
     v = np.sin(.19*(np.arange(start, stop)+1))
     truth = level.P(distributed.apply(level.P(v)), transpose=True)
@@ -81,9 +88,15 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
             first = Level(p, bridge, k, native, components,
                 teacher["depth"][lo:hi] >= 3, teacher["fixed"][lo:hi], config["interpolation"])
             stats["level1"] = first.stats
+            with np.load(old / "cache" / row["key"] / (teacher["retained_entry"]["shard_pattern"] % p.rank)) as f:
+                baseline_empty = np.diff(f["T0_indptr"]) == 0
+            mismatches = int(np.count_nonzero(first.special_fine & ~baseline_empty))
+            stats["special_fine_nonempty_in_base"] = int(p.reduce([mismatches])[0])
+            if stats["special_fine_nonempty_in_base"]:
+                failure = "special_fine_rule_disagrees_with_effective_base"
             if first.stats["uncovered_free_rows"] or first.stats["empty_free_rows"] or first.stats["injection_error"]:
                 failure = "first_interpolation_coverage_or_injection"
-            else:
+            if failure is None:
                 second_mask = np.isin(first.native, teacher["terminal_native"])
                 second = Level(p, bridge, first.coarse, first.native, first.components,
                     second_mask, np.zeros(len(first.native), dtype=bool), config["interpolation"])

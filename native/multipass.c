@@ -99,12 +99,13 @@ static int uncovered(hypre_ParCSRMatrix *s, const int *cf, long long *missing)
     return 0;
 }
 
-/* stats: input rows, coarse columns, uncovered F rows, empty F rows, P nnz.
+/* stats: input rows, coarse columns, uncovered F rows, empty F rows, P nnz,
+ * newly classified special F rows.
  * The caller supplies actual component IDs; coarse IDs are NOT index modulo 3.
  * Constrained rows use -3 and are handled by the unchanged fine smoother. */
-PetscErrorCode gnn_multipass(Mat a, const int *markers, const int *functions,
+PetscErrorCode gnn_multipass(Mat a, int *markers, const int *functions,
                             double strength, double truncation, int max_entries,
-                            Mat *p, Mat *coarse, long long stats[5])
+                            Mat *p, Mat *coarse, long long stats[6])
 {
     Mat hmat = NULL;
     hypre_ParCSRMatrix *h = NULL, *s = NULL, *hp = NULL;
@@ -113,7 +114,7 @@ PetscErrorCode gnn_multipass(Mat a, const int *markers, const int *functions,
     PetscErrorCode err = 0;
     PetscInt m, lo, hi;
     *p = NULL; *coarse = NULL;
-    for (int i = 0; i < 5; ++i) stats[i] = 0;
+    for (int i = 0; i < 6; ++i) stats[i] = 0;
 #define TRY(call) do { err = (call); if (err) goto cleanup; } while (0)
     TRY(MatConvert(a, MATHYPRE, MAT_INITIAL_MATRIX, &hmat));
     TRY(MatHYPREGetParCSR(hmat, &h));
@@ -126,6 +127,23 @@ PetscErrorCode gnn_multipass(Mat a, const int *markers, const int *functions,
         hypre_IntArrayData(dof)[i] = functions[i];
     }
     TRY(hypre_BoomerAMGCreateS(h, strength, 0.9, 3, hypre_IntArrayData(dof), &s));
+    /* Match par_coarsen.c: no outgoing strong neighbours => SF_PT.
+     * This is the existing numerical special-F convention, not a learned
+     * deletion or an excuse to overlook an uncovered interpolatable row. */
+    long long local_special = 0;
+    hypre_CSRMatrix *sd = hypre_ParCSRMatrixDiag(s), *so = hypre_ParCSRMatrixOffd(s);
+    for (PetscInt i = 0; i < m; ++i)
+    {
+        PetscInt degree = hypre_CSRMatrixI(sd)[i+1] - hypre_CSRMatrixI(sd)[i]
+                        + hypre_CSRMatrixI(so)[i+1] - hypre_CSRMatrixI(so)[i];
+        if (markers[i] == -1 && degree == 0)
+        {
+            markers[i] = -3;
+            hypre_IntArrayData(cf)[i] = -3;
+            ++local_special;
+        }
+    }
+    TRY(MPI_Allreduce(&local_special, &stats[5], 1, MPI_LONG_LONG, MPI_SUM, hypre_ParCSRMatrixComm(h)));
     TRY(uncovered(s, markers, &stats[2]));
     TRY(hypre_BoomerAMGCoarseParms(hypre_ParCSRMatrixComm(h), m, 3, dof, cf, &cdof, &starts));
     TRY(hypre_BoomerAMGBuildMultipass(h, hypre_IntArrayData(cf), s, starts, 3,

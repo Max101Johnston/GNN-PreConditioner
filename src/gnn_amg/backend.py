@@ -91,16 +91,19 @@ class Level:
         native = np.asarray(native, dtype=np.int64)
         assert native.shape == components.shape == selected.shape == constrained.shape
         cf = np.where(constrained, -3, np.where(selected, 1, -1)).astype(np.int32)
+        original_cf = cf.copy()
         functions = np.ascontiguousarray(components, dtype=np.int32)
         assert np.isin(functions, [0, 1, 2]).all()
         self.transfer, self.coarse = p.P(), p.P()
-        stats = np.zeros(5, np.int64)
+        stats = np.zeros(6, np.int64)
         code = bridge.gnn_multipass(matrix, cf.ctypes.data, functions.ctypes.data,
             setting["strength_threshold"], setting["truncation"], setting["max_entries"],
             C.byref(self.transfer), C.byref(self.coarse), stats.ctypes.data)
         if code:
             raise RuntimeError("multipass native error %d" % code)
-        self.stats = dict(zip(["fine_dofs", "coarse_dofs", "uncovered_free_rows", "empty_free_rows", "nnz"], map(int, stats)))
+        self.stats = dict(zip(["fine_dofs", "coarse_dofs", "uncovered_free_rows", "empty_free_rows", "nnz", "special_fine_rows"], map(int, stats)))
+        self.special_fine = (original_cf == -1) & (cf == -3)
+        self.executed_markers = cf.copy()
         self.native = native[cf == 1].copy()
         self.components = functions[cf == 1].copy()
         self.owners = ownership(p, self.coarse)
