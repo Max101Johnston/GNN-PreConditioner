@@ -137,3 +137,41 @@ independent acceptance; the original implementation stays for reproducibility.
 The `neutral_graph` control measures what this deterministic constraint alone
 achieves. Successful coverage by itself is neither convergence nor evidence
 of a learned speed improvement.
+
+## Persistent multi-frame reinforcement learning
+
+With `stage=rl`, `gnn_amg.online` keeps the 64-rank numerical environment
+resident and `gnn_amg.inference.PolicyLearner` keeps the policy and optimizer
+resident. Each uniformly sampled batch contains 2–4 different training states.
+A bounded neighbourhood is sampled from the current graph, alternating uniform
+and physical-field-contrast anchors. Outside it, the current frozen policy's
+deterministic decoder is used. Within it, a Bernoulli policy uses network
+scores and a fixed local prior favouring the frozen reference. Active draws and
+their actual probabilities are saved before numerical repair.
+
+Per-state gradients use true whole-solve seconds and a past-only EMA baseline.
+Gradients accumulate while policy parameters stay fixed, and Adam steps once
+all batch feedback has arrived. Warm-up updates the second head alone, then the
+first head alone; the shared trunk stays frozen in both phases. Joint training
+then unfreezes the trunk and both heads. Gradient norms, parameter changes,
+parameter hashes and original-vs-executed actions are recorded.
+
+Standard AMG supplies a measurable fixed reference for every saved training
+state; the accepted retained-base comparator is also measured for the fixed
+evaluation pool where its export exists. One common seconds scale is frozen
+across states and carried into continuation. Candidate numerical failures receive
+a penalty below every valid bounded-time reward. A collective convergence test
+checks the unchanged full-system true residual and the configured episode time
+limit. Setup, feature construction, inference and complete solve are included
+in the candidate time; parameter backpropagation and artifact writing are
+training overhead, excluded from candidate timing but included in the job budget.
+
+A smoke run must make a nonzero real update from three independent full solves
+and must revalidate the changed deterministic policy. It uses training states
+only. The subsequent 24-hour allocation rotates across all 55 training states
+and periodically evaluates a fixed held validation subset. Checkpoints contain
+model, optimizer, EMA, random states and update/phase identity. Batch selection
+uses the saved global update index, so continuation does not silently restart
+the schedule. Validation selection uses failure count and cumulative seconds,
+never the average of frame-wise speedup percentages. Saved-frame conclusions
+remain separate from actual restarted nonlinear time integration.

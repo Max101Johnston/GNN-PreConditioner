@@ -79,8 +79,9 @@ class PolicyClient:
         return reply, values
 
     def close(self):
-        self.request(dict(operation="stop"))
+        result, _ = self.request(dict(operation="stop"))
         self.stream.close()
+        return result
 
 
 def spatial_decode(scores, features, native, eligible, indptr, indices, fraction):
@@ -189,6 +190,225 @@ def graph_decode(scores, native, eligible, indptr, indices, radius):
         teacher_read=False, amg_coarsener_called=False)
 
 
+def local_exploration(frozen, eligible, features, indptr, indices, count, rng):
+    """One bounded graph neighbourhood; alternate damage contrast and uniform anchors."""
+    from scipy import sparse
+    n = len(frozen)
+    eligible = np.asarray(eligible, bool) & (np.diff(indptr) > 0)
+    anchors = np.flatnonzero(frozen & eligible)
+    if not len(anchors):
+        anchors = np.flatnonzero(eligible)
+    if not len(anchors):
+        raise ValueError("No eligible exploration anchor")
+    graph = sparse.csr_matrix((np.ones(len(indices)), indices, indptr), shape=(n, n))
+    focused = bool(rng.integers(2))
+    if focused:
+        phi = features[:, 0]
+        contrast = np.abs(phi - (graph @ phi)/np.maximum(1, np.diff(indptr)))
+        threshold = np.quantile(contrast[anchors], .75)
+        anchors = anchors[contrast[anchors] >= threshold]
+    anchor = int(rng.choice(anchors))
+    adjacency = (graph + graph.T).tocsr()
+    region = {anchor}
+    frontier = np.asarray([anchor], np.int64)
+    for _ in range(3):
+        neighbours = np.unique(np.concatenate([adjacency.indices[adjacency.indptr[i]:adjacency.indptr[i+1]] for i in frontier]))
+        frontier = np.asarray([i for i in neighbours if eligible[i] and i not in region], np.int64)
+        region.update(map(int, frontier))
+        if len(region) >= count or not len(frontier):
+            break
+    others = np.asarray(sorted(region - {anchor}), np.int64)
+    if len(others) > count-1:
+        others = rng.choice(others, count-1, replace=False)
+    mask = np.zeros(n, bool)
+    mask[np.r_[anchor, others]] = True
+    return mask, dict(anchor=anchor, focused=focused, active=int(mask.sum()))
+
+
+class PolicyLearner:
+    """Streaming exact on-policy gradients; optimizer steps only after the whole batch."""
+    def __init__(self, config, model, device, saved):
+        import torch
+        from .objective import RewardBaseline
+        self.config, self.model, self.device, self.saved = config, model, device, saved
+        self.settings = config["training"]
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=self.settings["learning_rate"])
+        self.baseline = RewardBaseline()
+        self.rng = np.random.default_rng(self.settings["seed"])
+        torch.manual_seed(self.settings["seed"])
+        self.update = 0
+        self.keys, self.pending, self.observations, self.action_arrays = [], {}, [], {}
+        self.best = None
+        self.common_scale = None
+        self.reference_times = {}
+        self.validation_round = 0
+        if saved.get("kind") == "reinforce":
+            self.optimizer.load_state_dict(saved["optimizer"])
+            self.baseline.values = saved["reward_baseline"]
+            self.rng.bit_generator.state = saved["rng_generator"]
+            torch.set_rng_state(saved["rng_torch"])
+            if device.type == "cuda" and saved.get("rng_cuda"):
+                torch.cuda.set_rng_state_all(saved["rng_cuda"])
+            self.update = saved["updates"]
+            self.best = saved.get("validation_best")
+            self.common_scale = saved.get("common_scale")
+            self.reference_times = saved.get("reference_times", {})
+            self.validation_round = saved.get("validation_round", 0)
+        self.initial_update = self.update
+
+    def identity(self):
+        import hashlib
+        h = hashlib.sha256()
+        for name, value in self.model.state_dict().items():
+            h.update(name.encode())
+            h.update(value.detach().cpu().numpy().tobytes())
+        return h.hexdigest()
+
+    def begin(self, request):
+        if self.keys:
+            raise RuntimeError("An on-policy batch is already active")
+        keys = request["keys"]
+        if not 2 <= len(keys) <= 4 or len(set(keys)) != len(keys):
+            raise ValueError("A batch requires two to four distinct training states")
+        scale = float(request["common_scale"])
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError("Invalid shared reward scale")
+        if self.common_scale is not None and scale != self.common_scale:
+            raise ValueError("The reward scale changed during training")
+        self.common_scale = scale
+        self.reference_times = request["reference_times"]
+        second, first = self.settings["phase_updates"]
+        self.phase = "second" if self.update < second else ("first" if self.update < second+first else "joint")
+        self.active_stages = (1,) if self.phase == "second" else ((0,) if self.phase == "first" else (0, 1))
+        # Shared features are fixed during the two head-only warm-up phases.
+        # Updating the shared trunk while claiming to freeze stage0 would be wrong.
+        for name, parameter in self.model.named_parameters():
+            parameter.requires_grad_(self.phase == "joint" or name.startswith("heads.%d." % self.active_stages[0]))
+        self.before = {name: p.detach().cpu().clone() for name, p in self.model.named_parameters()}
+        self.keys = list(keys)
+        self.pending, self.observations, self.action_arrays = {}, [], {}
+        self.optimizer.zero_grad(set_to_none=True)
+        return dict(update=self.update+1, policy_version=self.update, parameter_sha256=self.identity(),
+            phase=self.phase, keys=keys, common_scale=scale)
+
+    def active(self, request):
+        return bool(request.get("training") and request.get("key") in self.keys and request["stage"] in self.active_stages)
+
+    def sample(self, request, logits, frozen, arrays):
+        import torch
+        from .policy import sample_local
+        key, stage = request["key"], request["stage"]
+        mask, detail = local_exploration(frozen, arrays["eligible"], arrays["features"],
+            arrays["indptr"], arrays["indices"], self.settings["exploration_dofs"][stage], self.rng)
+        reference = torch.as_tensor(frozen, device=self.device)
+        eligible = torch.as_tensor(arrays["eligible"], device=self.device)
+        # The frozen reference and its centering are fixed within this batch.
+        # A configurable local prior favours retaining its choices; network
+        # score differences still alter the actual Bernoulli probabilities.
+        center = logits.detach()[eligible].median()
+        bias = float(np.log(self.settings["reference_probability"]/(1-self.settings["reference_probability"])))
+        local_logits = (logits-center)/self.settings["sampling_temperature"] + bias*(2*reference.float()-1)
+        sample = sample_local(local_logits, reference, torch.as_tensor(mask, device=self.device), eligible)
+        self.pending.setdefault(key, []).append(sample)
+        raw = sample.raw.cpu().numpy().copy()
+        probabilities = torch.sigmoid(local_logits.detach()).cpu().numpy()
+        tag = key+"-stage%d" % stage
+        active = np.flatnonzero(mask)
+        for name, value in dict(native=arrays["native"][active], probability=probabilities[active],
+                                draw=raw[active], frozen=frozen[active]).items():
+            self.action_arrays[tag+"-"+name] = np.asarray(value).copy()
+        detail.update(stage=stage, log_probability=float(sample.log_probability.detach()),
+            entropy=float(sample.entropy.detach()), changes=int(np.count_nonzero(raw != frozen)),
+            deletions=int(np.count_nonzero(frozen & ~raw)), additions=int(np.count_nonzero(~frozen & raw)),
+            raw_count=int(raw.sum()), reference_count=int(frozen.sum()),
+            likelihood="Original Bernoulli draws on active DOFs only; no repaired labels")
+        return raw, detail
+
+    def feedback(self, request):
+        from .objective import reinforce_loss, time_reward
+        key = request["key"]
+        if key not in self.keys or any(r["key"] == key for r in self.observations):
+            raise ValueError("Unexpected or repeated feedback")
+        reward = time_reward(self.reference_times[key], request["seconds"], self.common_scale,
+            self.settings["episode_timeout_seconds"], request["converged"])
+        samples = self.pending.pop(key, [])
+        past = self.baseline.get(key)
+        loss_value = None
+        if samples:
+            loss = reinforce_loss([dict(key=key, reward=reward, samples=samples, importance=1.0)], self.baseline)/len(self.keys)
+            loss_value = float(loss.detach())
+            loss.backward()
+        observation = dict(key=key, reward=reward, past_baseline=past, samples=len(samples),
+            seconds=request["seconds"], converged=request["converged"], failure=request.get("failure"),
+            loss=loss_value, sampling_probability=1/request["training_pool_size"], importance=1.0)
+        self.observations.append(observation)
+        return observation
+
+    def commit(self):
+        import torch
+        if len(self.observations) != len(self.keys) or self.pending:
+            raise RuntimeError("Cannot update an incomplete on-policy batch")
+        parameters = [p for p in self.model.parameters() if p.requires_grad]
+        gradient = torch.nn.utils.clip_grad_norm_(parameters, self.settings["gradient_clip"], error_if_nonfinite=True)
+        self.optimizer.step()
+        changes = {name: float(torch.linalg.vector_norm(p.detach().cpu()-self.before[name])) for name, p in self.model.named_parameters()}
+        assert all(np.isfinite(v) for v in changes.values())
+        self.baseline.update([(r["key"], r["reward"]) for r in self.observations])
+        self.update += 1
+        run = os.environ.get("GNN_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
+        root = Path(self.config["output_directory"])
+        path = root / "data" / ("rl-%s-update%06d-actions.npz" % (run, self.update))
+        with path.open("xb") as f:
+            np.savez_compressed(f, **self.action_arrays)
+        result = dict(update=self.update, phase=self.phase, parameter_sha256=self.identity(), gradient_norm=float(gradient),
+            parameter_delta_norm=float(np.sqrt(sum(v*v for v in changes.values()))),
+            parameter_changes=changes, observations=self.observations, common_scale=self.common_scale,
+            actions=dict(path=str(path), sha256=digest(path)), frozen_parameters_until_batch_complete=True)
+        self.keys, self.action_arrays = [], {}
+        if self.update == 1 or self.update % self.settings["checkpoint_interval"] == 0:
+            result["checkpoint"] = self.checkpoint("update")
+        record(self.config, "rl_update_complete", **result)
+        (root / "records" / ("rl-"+run+".json")).write_text(json.dumps(dict(state="running", latest=result,
+            best=self.best, updates_this_allocation=self.update-self.initial_update), indent=2)+"\n")
+        return result
+
+    def checkpoint(self, tag):
+        import torch
+        run = os.environ.get("GNN_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
+        path = Path(self.config["output_directory"]) / "checkpoints" / ("rl-%s-update%06d-%s.pt" % (run, self.update, tag))
+        if path.exists():
+            raise FileExistsError(path)
+        state = {name: self.saved[name] for name in ("feature_names", "feature_mean", "feature_scale", "coarse_fraction", "dataset_job")}
+        state.update(kind="reinforce", model=self.model.state_dict(), optimizer=self.optimizer.state_dict(),
+            updates=self.update, reward_baseline=self.baseline.values, rng_generator=self.rng.bit_generator.state,
+            rng_torch=torch.get_rng_state(), rng_cuda=torch.cuda.get_rng_state_all() if self.device.type == "cuda" else [],
+            common_scale=self.common_scale, reference_times=self.reference_times, config=self.config,
+            validation_best=self.best, validation_round=self.validation_round,
+            phase_updates=self.settings["phase_updates"])
+        with path.open("xb") as f:
+            torch.save(state, f)
+        return dict(path=str(path), sha256=digest(path), update=self.update)
+
+    def validation(self, request):
+        if self.keys:
+            raise RuntimeError("Validation cannot interrupt a frozen training batch")
+        cases = request["cases"]
+        self.validation_round += 1
+        if self.best is not None and {r["key"] for r in cases} != {r["key"] for r in self.best["cases"]}:
+            self.best = None  # training-smoke and held validation are different pools
+        failures = sum(not r["accurate"] for r in cases)
+        cost = sum(r["seconds"] if r["accurate"] else self.settings["episode_timeout_seconds"] for r in cases)
+        result = dict(update=self.update, failures=failures, cumulative_seconds=cost, cases=cases,
+            cumulative_scope="Fixed saved validation pool, not a full Newton trajectory")
+        score = (failures, cost)
+        if self.best is None or score < (self.best["failures"], self.best["cumulative_seconds"]):
+            self.best = result.copy()
+            result["checkpoint"] = self.checkpoint("validation%04d" % self.validation_round)
+            self.best["checkpoint"] = result["checkpoint"]
+        record(self.config, "rl_validation_complete", **result)
+        return result
+
+
 def serve(config, endpoint):
     import torch
     from .policy import TwoStagePolicy
@@ -211,6 +431,7 @@ def serve(config, endpoint):
     model.eval()
     mean, scale = saved["feature_mean"], saved["feature_scale"]
     fractions = saved["coarse_fraction"]
+    learner = PolicyLearner(config, model, device, saved) if config["stage"] == "rl" else None
     listener = socket.socket()
     listener.bind(("0.0.0.0", 0))
     listener.listen(1)
@@ -239,8 +460,19 @@ def serve(config, endpoint):
         while True:
             request, arrays = receive_packet(stream)
             if request["operation"] == "stop":
-                send_packet(stream, dict(stopped=True, calls=calls))
+                final = learner.checkpoint("final") if learner is not None else None
+                send_packet(stream, dict(stopped=True, calls=calls, checkpoint=final))
                 break
+            if request["operation"] == "ping":
+                send_packet(stream, dict(alive=True))
+                continue
+            if learner is not None and request["operation"] in ("begin_batch", "feedback", "commit", "validation"):
+                operation = request["operation"]
+                reply = (learner.begin(request) if operation == "begin_batch" else
+                         learner.feedback(request) if operation == "feedback" else
+                         learner.commit() if operation == "commit" else learner.validation(request))
+                send_packet(stream, reply)
+                continue
             if request["operation"] != "select":
                 raise ValueError("Unsupported policy operation")
             begin = time.perf_counter()
@@ -262,9 +494,10 @@ def serve(config, endpoint):
                 graph = torch.sparse_csr_tensor(torch.as_tensor(arrays["indptr"], dtype=torch.int64),
                     torch.as_tensor(arrays["indices"], dtype=torch.int64), torch.as_tensor(arrays["weights"]),
                     size=(n, n), device=device)
-                with torch.no_grad():
-                    scores = model(torch.as_tensor(x, device=device), graph,
-                        torch.as_tensor(prior, device=device), stage).cpu().numpy()
+                with torch.set_grad_enabled(learner is not None and learner.active(request)):
+                    logits = model(torch.as_tensor(x, device=device), graph,
+                        torch.as_tensor(prior, device=device), stage)
+                scores = logits.detach().cpu().numpy()
                 if use_cuda:
                     torch.cuda.synchronize()
                 network_seconds = time.perf_counter()-network_start
@@ -275,8 +508,13 @@ def serve(config, endpoint):
             else:
                 selected, decoded = spatial_decode(scores, features, arrays["native"], arrays["eligible"],
                     arrays["indptr"], arrays["indices"], float(fractions[stage]))
+            sampling = None
+            if learner is not None and learner.active(request):
+                selected, sampling = learner.sample(request, logits, selected, arrays)
             calls += 1
-            reply = dict(stage=stage, decoder=decoded, network_with_copies_s=network_seconds, device=str(device),
+            reply = dict(stage=stage, sampling=sampling, decoder=decoded,
+                parameter_sha256=learner.identity() if learner is not None else None,
+                network_with_copies_s=network_seconds, device=str(device),
                 service_compute_s=time.perf_counter()-begin, neutral=request.get("neutral", False))
             send_packet(stream, reply, dict(selected=selected))
     except BaseException as error:

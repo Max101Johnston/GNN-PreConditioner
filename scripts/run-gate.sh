@@ -37,7 +37,7 @@ unset PETSC_OPTIONS SINGULARITYENV_PETSC_OPTIONS
 if [[ "$(cfg stage)" == "pretrain" ]]; then
     export LD_LIBRARY_PATH="$(cfg cuda_toolkit)/lib64:${LD_LIBRARY_PATH:-}"
     "$(cfg torch_python)" -B -m gnn_amg.pretrain "$config"
-elif [[ "$(cfg stage)" == "prediction" ]]; then
+elif [[ "$(cfg stage)" == "prediction" || "$(cfg stage)" == "rl" ]]; then
     export GNN_RUN_ID="${SLURM_JOB_ID_HET_GROUP_0:-$SLURM_JOB_ID}"
     export SINGULARITYENV_GNN_RUN_ID="$GNN_RUN_ID"
     endpoint="$task/records/rpc-$GNN_RUN_ID.json"

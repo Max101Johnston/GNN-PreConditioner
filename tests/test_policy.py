@@ -51,6 +51,81 @@ class PolicyTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(head.weight).all())
             self.assertFalse(torch.equal(old, head.weight))
 
+    def test_streaming_on_policy_batch_and_checkpoint_resume(self):
+        import copy
+        import json
+        import tempfile
+        from pathlib import Path
+        import numpy as np
+        from scipy import sparse
+        from gnn_amg.inference import PolicyLearner
+        from gnn_amg.backend import digest
+        # Artifacts stay outside the source tree. Do not recursively remove them.
+        root = Path(tempfile.mkdtemp(prefix="gnn-rl-test-"))
+        for name in ("records", "data", "checkpoints"):
+            (root/name).mkdir()
+        settings = dict(seed=81, learning_rate=1e-3, phase_updates=[20, 20],
+            exploration_dofs=[4, 4], reference_probability=.8, sampling_temperature=1.,
+            episode_timeout_seconds=10., gradient_clip=1e6, checkpoint_interval=20)
+        config = dict(training=settings, output_directory=str(root))
+        torch.manual_seed(4)
+        model = TwoStagePolicy(5)
+        saved = dict(feature_names=list("abcde"), feature_mean=np.zeros((2, 5)),
+            feature_scale=np.ones((2, 5)), coarse_fraction=np.array([.1, .1]), dataset_job="test")
+        learner = PolicyLearner(config, model, torch.device("cpu"), saved)
+        learner.baseline.values = {"a": .3, "b": -.2}
+        initial = {name: p.detach().clone() for name, p in model.named_parameters()}
+        learner.begin(dict(keys=["a", "b"], common_scale=2., reference_times={"a": 5., "b": 4.}))
+        n = 9
+        graph = sparse.diags([np.ones(n-1), np.ones(n-1)], [-1, 1], shape=(n, n)).tocsr()
+        features = np.arange(n*5, dtype=np.float32).reshape(n, 5)/17
+        arrays = dict(native=np.arange(n), eligible=np.ones(n, bool), features=features,
+            indptr=graph.indptr, indices=graph.indices)
+        frozen = np.arange(n) % 3 == 0
+        tensor_graph = torch.tensor(graph.toarray(), dtype=torch.float32).to_sparse_csr()
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        expected = [torch.zeros_like(p) for p in trainable]
+        for key, seconds in (("a", 2.), ("b", 3.)):
+            logits = model(torch.tensor(features), tensor_graph, torch.zeros(n), 1)
+            raw, detail = learner.sample(dict(key=key, stage=1), logits, frozen, arrays)
+            sample = learner.pending[key][0]
+            tag = key+"-stage1"
+            probability = learner.action_arrays[tag+"-probability"]
+            draws = learner.action_arrays[tag+"-draw"]
+            actual_log = np.where(draws, np.log(probability), np.log1p(-probability)).sum()
+            self.assertAlmostEqual(actual_log, detail["log_probability"], places=5)
+            reward = ((5. if key == "a" else 4.)-seconds)/2.
+            loss = -(reward-learner.baseline.get(key))*sample.log_probability/2
+            derivative = torch.autograd.grad(loss, trainable, retain_graph=True)
+            expected = [a+b for a, b in zip(expected, derivative)]
+            execution = raw.copy()
+            execution[:] = True  # numerical repair must never rewrite raw likelihood
+            response = learner.feedback(dict(key=key, seconds=seconds, converged=True, training_pool_size=2))
+            self.assertEqual(response["past_baseline"], .3 if key == "a" else -.2)
+            for name, p in model.named_parameters():
+                self.assertTrue(torch.equal(p, initial[name]))
+        for parameter, derivative in zip(trainable, expected):
+            torch.testing.assert_close(parameter.grad, derivative)
+        result = learner.commit()
+        self.assertGreater(result["parameter_delta_norm"], 0)
+        self.assertEqual(result["phase"], "second")
+        for name, delta in result["parameter_changes"].items():
+            if not name.startswith("heads.1."):
+                self.assertEqual(delta, 0)
+        receipt = result["checkpoint"]
+        self.assertEqual(digest(receipt["path"]), receipt["sha256"])
+        checkpoint = torch.load(receipt["path"], map_location="cpu")
+        restored_model = TwoStagePolicy(5)
+        restored_model.load_state_dict(checkpoint["model"])
+        restored = PolicyLearner(config, restored_model, torch.device("cpu"), checkpoint)
+        self.assertEqual(restored.update, 1)
+        self.assertEqual(restored.baseline.values, learner.baseline.values)
+        self.assertEqual(json.dumps(restored.rng.bit_generator.state), json.dumps(learner.rng.bit_generator.state))
+        for key, values in learner.optimizer.state_dict()["state"].items():
+            for name, value in values.items():
+                torch.testing.assert_close(restored.optimizer.state_dict()["state"][key][name], value)
+        self.assertTrue(torch.equal(torch.get_rng_state(), checkpoint["rng_torch"]))
+
 
 if __name__ == "__main__":
     unittest.main()

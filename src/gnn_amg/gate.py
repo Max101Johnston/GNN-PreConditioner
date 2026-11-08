@@ -193,8 +193,14 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
     if failure:
         result = dict(reached_true_target=False, failure=failure)
     else:
-        result = legacy.solve_with_true_residual(p, replay, outer, full, rhs, solution,
-            config["max_iterations"], max(1e-12, 1e-8*rhs_norm), True)
+        if config["stage"] == "rl":
+            from .backend import solve_with_deadline
+            result = solve_with_deadline(p, replay, outer, full, rhs, solution,
+                config["max_iterations"], max(1e-12, 1e-8*rhs_norm),
+                start+config["training"]["episode_timeout_seconds"])
+        else:
+            result = legacy.solve_with_true_residual(p, replay, outer, full, rhs, solution,
+                config["max_iterations"], max(1e-12, 1e-8*rhs_norm), True)
         result["total_wall_s"] = p.maximum(result.pop("_solve_end_time")-start)
         result["failure"] = None if result["reached_true_target"] else "gmres_true_residual"
     result.update(method=method, setup_wall_s=setup, numerical=stats,

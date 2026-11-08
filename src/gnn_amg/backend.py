@@ -163,7 +163,9 @@ class Hierarchy:
             p.call("MatRestoreRow", second.coarse, row, C.byref(count), C.byref(columns), C.byref(values))
         self.energy = p.reduce(dense)
         self.condition = float(np.linalg.cond(self.energy))
-        assert np.isfinite(self.condition) and self.condition < 1e12
+        if not np.isfinite(self.condition) or self.condition >= 1e12:
+            self.middle.close()
+            raise ValueError("terminal_condition_limit")
         self.factor = la.lu_factor(self.energy)
         self.solve = la.lu_solve
 
@@ -259,3 +261,44 @@ def pooled_attributes(p, level, attributes):
     means = weighted / mass[:, None]
     lo, hi = map(int, level.owners[p.rank:p.rank+2])
     return means[lo:hi].copy(), mass[lo:hi].copy()
+
+def solve_with_deadline(p, replay, outer, matrix, rhs, solution, cap, true_limit, deadline):
+    """Same full-system true-residual stop, with a collective wall-clock limit."""
+    build, work = p.vector(matrix), p.vector(matrix)
+    history, errors = [], []
+    def converge(ksp, iteration, internal, reason, context):
+        try:
+            current = p.P()
+            p.call("KSPBuildSolution", ksp, build, C.byref(current))
+            p.call("MatMult", matrix, current, work)
+            p.call("VecAYPX", work, -1., rhs)
+            residual = p.norm(work)
+            overdue = p.maximum(float(time.perf_counter() > deadline)) > 0
+            history.append(dict(iteration=int(iteration), internal_norm=float(internal), true_residual=residual))
+            reason[0] = -5 if overdue else (2 if residual <= true_limit else (-9 if not np.isfinite(residual) else (-3 if iteration >= cap else 0)))
+            return 0
+        except BaseException as error:
+            errors.append(str(error))
+            return 76
+    callback = C.CFUNCTYPE(p.I, p.P, p.I, p.D, C.POINTER(p.I), p.P)(converge)
+    p.call("KSPSetConvergenceTest", outer, C.cast(callback, p.P), None, None)
+    p.barrier()
+    begin = time.perf_counter()
+    p.call("KSPSolve", outer, rhs, solution)
+    end = time.perf_counter()
+    assert not errors, errors
+    iteration, reason = p.I(), p.I()
+    p.call("KSPGetIterationNumber", outer, C.byref(iteration))
+    p.call("KSPGetConvergedReason", outer, C.byref(reason))
+    p.call("MatMult", matrix, solution, work)
+    p.call("VecAYPX", work, -1., rhs)
+    residual = p.norm(work)
+    expired = p.maximum(float(end > deadline)) > 0
+    p.destroy("Vec", build, work)
+    return dict(iterations=iteration.value, reason=reason.value, cap=cap, true_limit=true_limit,
+        final_true_residual=residual if np.isfinite(residual) else None,
+        reached_true_target=bool(np.isfinite(residual) and residual <= true_limit),
+        timed_out=expired, solve_s=p.maximum(end-begin), _solve_end_time=end,
+        residual_curve=history, diagnostic_trace=True,
+        stopping="Full true residual every iteration plus collective elapsed-time limit")
+
