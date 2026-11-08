@@ -139,13 +139,22 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
                 ("repair-%s-%s-r%03d.npz" % (os.environ.get("SLURM_JOB_ID", "local"), row["key"], p.rank)),
                 native=native, raw_selected=teacher["depth"][lo:hi] >= 3,
                 executed_markers=first.executed_markers, raw_uncovered=first.raw_uncovered)
-            with np.load(old / "cache" / row["key"] / (teacher["retained_entry"]["shard_pattern"] % p.rank)) as f:
-                baseline_empty = np.diff(f["T0_indptr"]) == 0
-            stats["raw_uncovered_nonempty_in_base"] = int(p.reduce([np.count_nonzero(first.raw_uncovered & ~baseline_empty)])[0])
-            mismatches = int(np.count_nonzero(first.special_fine & ~baseline_empty))
-            stats["special_fine_nonempty_in_base"] = int(p.reduce([mismatches])[0])
-            if stats["special_fine_nonempty_in_base"]:
-                failure = "special_fine_rule_disagrees_with_effective_base"
+            stats["retained_reference_available"] = teacher["retained_entry"] is not None
+            if teacher["retained_entry"] is not None:
+                with np.load(old / "cache" / row["key"] / (teacher["retained_entry"]["shard_pattern"] % p.rank)) as f:
+                    baseline_empty = np.diff(f["T0_indptr"]) == 0
+                stats["raw_uncovered_nonempty_in_base"] = int(p.reduce([np.count_nonzero(first.raw_uncovered & ~baseline_empty)])[0])
+                mismatches = int(np.count_nonzero(first.special_fine & ~baseline_empty))
+                stats["special_fine_nonempty_in_base"] = int(p.reduce([mismatches])[0])
+                if stats["special_fine_nonempty_in_base"]:
+                    failure = "special_fine_rule_disagrees_with_effective_base"
+            else:
+                # Most training labels have no pre-exported old retained P.
+                # No special-F row may be accepted without that reference.
+                stats["raw_uncovered_nonempty_in_base"] = None
+                stats["special_fine_nonempty_in_base"] = None
+                if first.stats["special_fine_rows"]:
+                    failure = "special_fine_requires_retained_reference"
             if first.stats["repair_budget_exhausted"] or first.stats["uncovered_free_rows"] or first.stats["empty_free_rows"] or first.stats["injection_error"]:
                 failure = "first_interpolation_coverage_or_injection"
             if failure is None:
@@ -251,8 +260,13 @@ def main():
             assert digest(old / "data" / key / "fields.npz") == field_record["sha256"]
             with np.load(old / "data" / key / "fields.npz") as f:
                 fixed = f["constrained"][native]
-            export = read_json(old / "records" / ("solver-export-retained-solver-" + key + ".json"))
-            entry = next(e for e in export["spaces"] if e["label"] == config["baseline_label"])
+            export_path = old / "records" / ("solver-export-retained-solver-" + key + ".json")
+            entry = None
+            if export_path.exists():
+                export = read_json(export_path)
+                entry = next(e for e in export["spaces"] if e["label"] == config["baseline_label"])
+            elif not config.get("export_supervised"):
+                raise FileNotFoundError(export_path)
             teacher = dict(native=native, depth=depth, terminal_native=native[depth >= 5],
                            fixed=fixed, retained_entry=entry)
             data = replay.pcapply_snapshot(p, row, layout)
