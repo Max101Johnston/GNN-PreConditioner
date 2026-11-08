@@ -5,6 +5,7 @@
 #include <_hypre_parcsr_ls.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 _Static_assert(PETSC_VERSION_MAJOR == 3 && PETSC_VERSION_MINOR == 16 &&
                    PETSC_VERSION_SUBMINOR == 3, "PETSc ABI mismatch");
@@ -56,56 +57,121 @@ static PetscErrorCode import_parcsr(hypre_ParCSRMatrix *h, Mat *a)
     return 0;
 }
 
-/* Nine directed strong-connection hops are the actual multipass 2.23 limit.
- * This audit includes remote neighbours and never treats MPI borders as cracks.
- * Return counts only; the gate must not silently modify the teacher C-points. */
-static int uncovered(hypre_ParCSRMatrix *s, const int *cf, long long *missing)
+/* Propagate synchronously along actual directed strong dependencies. */
+static long long propagate(hypre_ParCSRMatrix *s, int *local, int *global,
+                           const int *cf, const int *counts, const int *offsets,
+                           int passes)
 {
     MPI_Comm comm = hypre_ParCSRMatrixComm(s);
     hypre_CSRMatrix *d = hypre_ParCSRMatrixDiag(s), *o = hypre_ParCSRMatrixOffd(s);
-    int ranks, m = hypre_CSRMatrixNumRows(d), n = hypre_ParCSRMatrixGlobalNumRows(s);
-    int *counts, *offsets, *local, *global;
-    MPI_Comm_size(comm, &ranks);
-    counts = calloc(ranks, sizeof(int)); offsets = calloc(ranks, sizeof(int));
-    local = calloc(m ? m : 1, sizeof(int)); global = calloc(n ? n : 1, sizeof(int));
-    int ok = counts && offsets && local && global, all_ok;
-    MPI_Allreduce(&ok, &all_ok, 1, MPI_INT, MPI_MIN, comm);
-    if (!all_ok) { free(counts); free(offsets); free(local); free(global); return 55; }
-    MPI_Allgather(&m, 1, MPI_INT, counts, 1, MPI_INT, comm);
-    for (int i = 1; i < ranks; ++i) offsets[i] = offsets[i-1] + counts[i-1];
-    for (int i = 0; i < m; ++i) local[i] = cf[i] == 1;
-    for (int pass = 1; pass <= 9; ++pass)
+    int m = hypre_CSRMatrixNumRows(d), first = hypre_ParCSRMatrixFirstRowIndex(s);
+    for (int pass = 0; pass < passes; ++pass)
     {
-        MPI_Allgatherv(local, m, MPI_INT, global, counts, offsets, MPI_INT, comm);
+        (void)MPI_Allgatherv(local, m, MPI_INT, global, counts, offsets, MPI_INT, comm);
+        int changed = 0, total_changed;
         for (int i = 0; i < m; ++i)
         {
             if (local[i] || cf[i] == -3) continue;
             for (int j = hypre_CSRMatrixI(d)[i]; j < hypre_CSRMatrixI(d)[i+1]; ++j)
             {
                 int c = hypre_CSRMatrixJ(d)[j];
-                if (c >= 0 && global[hypre_ParCSRMatrixFirstRowIndex(s)+c]) local[i] = 1;
+                if (c >= 0 && global[first+c]) local[i] = 1;
             }
             for (int j = hypre_CSRMatrixI(o)[i]; j < hypre_CSRMatrixI(o)[i+1]; ++j)
             {
                 int c = hypre_CSRMatrixJ(o)[j];
                 if (c >= 0 && global[hypre_ParCSRMatrixColMapOffd(s)[c]]) local[i] = 1;
             }
+            changed += local[i];
         }
+        MPI_Allreduce(&changed, &total_changed, 1, MPI_INT, MPI_SUM, comm);
+        if (!total_changed) break;
     }
-    long long here = 0;
+    (void)MPI_Allgatherv(local, m, MPI_INT, global, counts, offsets, MPI_INT, comm);
+    long long here = 0, missing;
     for (int i = 0; i < m; ++i) here += cf[i] == -1 && !local[i];
-    MPI_Allreduce(&here, missing, 1, MPI_LONG_LONG, MPI_SUM, comm);
+    MPI_Allreduce(&here, &missing, 1, MPI_LONG_LONG, MPI_SUM, comm);
+    return missing;
+}
+
+/* Fixed environment repair. Preserve every proposed C point, then add only
+ * uncovered F points. Native IDs break ties independently of MPI partitioning.
+ * Simultaneous local minima among uncovered outgoing neighbours are promoted;
+ * repeat only if the actual nine-hop audit still fails. This is never called
+ * as a replacement coarsener: the caller requires a nonempty proposal and caps
+ * additions. Raw 9/99-hop diagnostics and all promoted rows remain observable.
+ * flags: 1 originally uncovered at 9 hops, 2 still uncovered at 99 hops,
+ *        4 promoted by repair. An exhausted budget is a failed candidate. */
+static int uncovered(hypre_ParCSRMatrix *s, int *cf, const int64_t *native,
+                     int max_repairs, int *flags, long long stats[11])
+{
+    MPI_Comm comm = hypre_ParCSRMatrixComm(s);
+    hypre_CSRMatrix *d = hypre_ParCSRMatrixDiag(s), *o = hypre_ParCSRMatrixOffd(s);
+    int ranks, m = hypre_CSRMatrixNumRows(d), n = hypre_ParCSRMatrixGlobalNumRows(s);
+    int first = hypre_ParCSRMatrixFirstRowIndex(s);
+    MPI_Comm_size(comm, &ranks);
+    int *counts = calloc(ranks, sizeof(int)), *offsets = calloc(ranks, sizeof(int));
+    int *local = calloc(m ? m : 1, sizeof(int)), *global = calloc(n ? n : 1, sizeof(int));
+    int *missing = calloc(n ? n : 1, sizeof(int)), *candidate = calloc(m ? m : 1, sizeof(int));
+    int64_t *ids = calloc(n ? n : 1, sizeof(int64_t));
+    int ok = counts && offsets && local && global && missing && candidate && ids, all_ok;
+    MPI_Allreduce(&ok, &all_ok, 1, MPI_INT, MPI_MIN, comm);
+    if (!all_ok) { free(counts); free(offsets); free(local); free(global);
+        free(missing); free(candidate); free(ids); return 55; }
+    (void)MPI_Allgather(&m, 1, MPI_INT, counts, 1, MPI_INT, comm);
+    for (int i = 1; i < ranks; ++i) offsets[i] = offsets[i-1] + counts[i-1];
+    (void)MPI_Allgatherv(native, m, MPI_INT64_T, ids, counts, offsets, MPI_INT64_T, comm);
+    for (int i = 0; i < m; ++i) { local[i] = cf[i] == 1; flags[i] = 0; }
+    stats[6] = propagate(s, local, global, cf, counts, offsets, 9);
+    for (int i = 0; i < m; ++i) if (cf[i] == -1 && !local[i]) flags[i] |= 1;
+    stats[7] = stats[6] ? propagate(s, local, global, cf, counts, offsets, 90) : 0;
+    for (int i = 0; i < m; ++i) if (cf[i] == -1 && !local[i]) flags[i] |= 2;
+    stats[2] = stats[6];
+    while (stats[2])
+    {
+        for (int i = 0; i < m; ++i) local[i] = cf[i] == 1;
+        stats[2] = propagate(s, local, global, cf, counts, offsets, 9);
+        if (!stats[2]) break;
+        for (int i = 0; i < m; ++i) candidate[i] = cf[i] == -1 && !local[i];
+        (void)MPI_Allgatherv(candidate, m, MPI_INT, missing, counts, offsets, MPI_INT, comm);
+        long long here = 0, total;
+        for (int i = 0; i < m; ++i)
+        {
+            if (!candidate[i]) continue;
+            for (int j = hypre_CSRMatrixI(d)[i]; j < hypre_CSRMatrixI(d)[i+1]; ++j)
+            {
+                int c = hypre_CSRMatrixJ(d)[j];
+                if (c >= 0 && missing[first+c] && ids[first+c] < native[i]) candidate[i] = 0;
+            }
+            for (int j = hypre_CSRMatrixI(o)[i]; j < hypre_CSRMatrixI(o)[i+1]; ++j)
+            {
+                int c = hypre_CSRMatrixJ(o)[j];
+                if (c >= 0) { int g = hypre_ParCSRMatrixColMapOffd(s)[c];
+                    if (missing[g] && ids[g] < native[i]) candidate[i] = 0; }
+            }
+            here += candidate[i];
+        }
+        MPI_Allreduce(&here, &total, 1, MPI_LONG_LONG, MPI_SUM, comm);
+        if (!total || stats[8]+total > max_repairs || stats[9] >= 16)
+        { stats[10] = 1; break; }
+        for (int i = 0; i < m; ++i) if (candidate[i]) { cf[i] = 1; flags[i] |= 4; }
+        stats[8] += total;
+        ++stats[9];
+    }
     free(counts); free(offsets); free(local); free(global);
+    free(missing); free(candidate); free(ids);
     return 0;
 }
 
 /* stats: input rows, coarse columns, uncovered F rows, empty F rows, P nnz,
- * newly classified special F rows.
+ * newly classified special F rows, raw uncovered at 9/99 hops,
+ * added C points, repair rounds, exhausted-repair-budget flag.
  * The caller supplies actual component IDs; coarse IDs are NOT index modulo 3.
  * Constrained rows use -3 and are handled by the unchanged fine smoother. */
 PetscErrorCode gnn_multipass(Mat a, int *markers, const int *functions,
                             double strength, double truncation, int max_entries,
-                            Mat *p, Mat *coarse, long long stats[6])
+                            const int64_t *native, int max_repairs, int *flags,
+                            Mat *p, Mat *coarse, long long stats[11])
 {
     Mat hmat = NULL;
     hypre_ParCSRMatrix *h = NULL, *s = NULL, *hp = NULL;
@@ -114,7 +180,7 @@ PetscErrorCode gnn_multipass(Mat a, int *markers, const int *functions,
     PetscErrorCode err = 0;
     PetscInt m, lo, hi;
     *p = NULL; *coarse = NULL;
-    for (int i = 0; i < 6; ++i) stats[i] = 0;
+    for (int i = 0; i < 11; ++i) stats[i] = 0;
 #define TRY(call) do { err = (call); if (err) goto cleanup; } while (0)
     TRY(MatConvert(a, MATHYPRE, MAT_INITIAL_MATRIX, &hmat));
     TRY(MatHYPREGetParCSR(hmat, &h));
@@ -144,7 +210,8 @@ PetscErrorCode gnn_multipass(Mat a, int *markers, const int *functions,
         }
     }
     TRY(MPI_Allreduce(&local_special, &stats[5], 1, MPI_LONG_LONG, MPI_SUM, hypre_ParCSRMatrixComm(h)));
-    TRY(uncovered(s, markers, &stats[2]));
+    TRY(uncovered(s, markers, native, max_repairs, flags, stats));
+    for (PetscInt i = 0; i < m; ++i) hypre_IntArrayData(cf)[i] = markers[i];
     TRY(hypre_BoomerAMGCoarseParms(hypre_ParCSRMatrixComm(h), m, 3, dof, cf, &cdof, &starts));
     TRY(hypre_BoomerAMGBuildMultipass(h, hypre_IntArrayData(cf), s, starts, 3,
         hypre_IntArrayData(dof), 0, truncation, max_entries, 0, &hp));

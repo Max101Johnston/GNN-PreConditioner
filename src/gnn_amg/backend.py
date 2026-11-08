@@ -95,13 +95,23 @@ class Level:
         functions = np.ascontiguousarray(components, dtype=np.int32)
         assert np.isin(functions, [0, 1, 2]).all()
         self.transfer, self.coarse = p.P(), p.P()
-        stats = np.zeros(6, np.int64)
+        stats = np.zeros(11, np.int64)
+        flags = np.zeros(len(native), np.int32)
+        proposed = int(p.reduce([np.count_nonzero(cf == 1)])[0])
+        if not proposed:
+            raise ValueError("An empty C proposal cannot be repaired")
+        budget = int(proposed * setting.get("coverage_repair_fraction", 0.0))
+        if "max_coarse_dofs" in setting:
+            budget = min(budget, max(0, setting["max_coarse_dofs"] - proposed))
         code = bridge.gnn_multipass(matrix, cf.ctypes.data, functions.ctypes.data,
             setting["strength_threshold"], setting["truncation"], setting["max_entries"],
+            native.ctypes.data, budget, flags.ctypes.data,
             C.byref(self.transfer), C.byref(self.coarse), stats.ctypes.data)
         if code:
             raise RuntimeError("multipass native error %d" % code)
-        self.stats = dict(zip(["fine_dofs", "coarse_dofs", "uncovered_free_rows", "empty_free_rows", "nnz", "special_fine_rows"], map(int, stats)))
+        self.stats = dict(zip(["fine_dofs", "coarse_dofs", "uncovered_free_rows", "empty_free_rows", "nnz", "special_fine_rows", "raw_uncovered_9_hops", "raw_uncovered_99_hops", "repair_added_coarse", "repair_rounds", "repair_budget_exhausted"], map(int, stats)))
+        self.raw_uncovered = (flags & 1) != 0
+        self.repair_added = (flags & 4) != 0
         self.special_fine = (original_cf == -1) & (cf == -3)
         self.executed_markers = cf.copy()
         self.native = native[cf == 1].copy()
@@ -187,7 +197,7 @@ class Hierarchy:
 
 def load_bridge(p, path):
     bridge = C.CDLL(str(path))
-    bridge.gnn_multipass.argtypes = [p.P, p.P, p.P, p.D, p.D, p.I,
+    bridge.gnn_multipass.argtypes = [p.P, p.P, p.P, p.D, p.D, p.I, p.P, p.I, p.P,
                                     C.POINTER(p.P), C.POINTER(p.P), p.P]
     bridge.gnn_multipass.restype = p.I
     return bridge

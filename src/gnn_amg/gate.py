@@ -50,6 +50,34 @@ def numerical_smoke(config, p, legacy, bridge):
             galerkin_relative=relative, interpolation=level.stats)
     level.close()
     distributed.close()
+    if p.size >= 20:
+        # Three disconnected component chains with no proposed C points in
+        # their last six nodes. Connectivity crosses rank ownership borders.
+        cut = n - 18
+        matrix = matrix.tolil()
+        for component in range(3):
+            matrix[cut-3+component, cut+component] = 0
+            matrix[cut+component, cut-3+component] = 0
+        matrix = matrix.tocsr()
+        matrix.eliminate_zeros()
+        distributed = legacy.DistributedSparse(p, matrix[lo:hi], owners, owners)
+        proposal = (native < cut) & (((native//3) % 3 == 0) | (native//3 == p.size-7))
+        for fraction in (0.0, 0.2):
+            setting = dict(config["interpolation"], coverage_repair_fraction=fraction)
+            repaired = Level(p, bridge, distributed.matrix, native,
+                (native % 3).astype(np.int32), proposal, np.zeros(3, bool), setting)
+            assert repaired.stats["raw_uncovered_9_hops"] == 18
+            assert repaired.stats["raw_uncovered_99_hops"] == 18
+            assert repaired.stats["repair_added_coarse"] == (3 if fraction else 0)
+            assert repaired.stats["uncovered_free_rows"] == (0 if fraction else 18)
+            assert repaired.stats["repair_budget_exhausted"] == (0 if fraction else 1)
+            assert np.all(repaired.executed_markers[proposal] == 1)
+            assert repaired.stats["injection_error"] == 0
+            if p.rank == 0:
+                record(config, "coverage_repair_smoke_passed", budget_fraction=fraction,
+                    interpolation=repaired.stats)
+            repaired.close()
+        distributed.close()
 
 
 def run_method(config, p, replay, legacy, bridge, row, layout, data, method, teacher):
@@ -88,20 +116,32 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
             first = Level(p, bridge, k, native, components,
                 teacher["depth"][lo:hi] >= 3, teacher["fixed"][lo:hi], config["interpolation"])
             stats["level1"] = first.stats
+            # Rank shards preserve original versus executed selections; these
+            # arrays are outputs, never policy labels or on-policy actions.
+            np.savez_compressed(Path(config["output_directory"]) / "data" /
+                ("repair-%s-%s-r%03d.npz" % (os.environ.get("SLURM_JOB_ID", "local"), row["key"], p.rank)),
+                native=native, raw_selected=teacher["depth"][lo:hi] >= 3,
+                executed_markers=first.executed_markers, raw_uncovered=first.raw_uncovered)
             with np.load(old / "cache" / row["key"] / (teacher["retained_entry"]["shard_pattern"] % p.rank)) as f:
                 baseline_empty = np.diff(f["T0_indptr"]) == 0
+            stats["raw_uncovered_nonempty_in_base"] = int(p.reduce([np.count_nonzero(first.raw_uncovered & ~baseline_empty)])[0])
             mismatches = int(np.count_nonzero(first.special_fine & ~baseline_empty))
             stats["special_fine_nonempty_in_base"] = int(p.reduce([mismatches])[0])
             if stats["special_fine_nonempty_in_base"]:
                 failure = "special_fine_rule_disagrees_with_effective_base"
-            if first.stats["uncovered_free_rows"] or first.stats["empty_free_rows"] or first.stats["injection_error"]:
+            if first.stats["repair_budget_exhausted"] or first.stats["uncovered_free_rows"] or first.stats["empty_free_rows"] or first.stats["injection_error"]:
                 failure = "first_interpolation_coverage_or_injection"
             if failure is None:
                 second_mask = np.isin(first.native, teacher["terminal_native"])
                 second = Level(p, bridge, first.coarse, first.native, first.components,
-                    second_mask, np.zeros(len(first.native), dtype=bool), config["interpolation"])
+                    second_mask, np.zeros(len(first.native), dtype=bool),
+                    dict(config["interpolation"], max_coarse_dofs=config["terminal_max_dofs"]))
                 stats["level2"] = second.stats
-                if second.stats["uncovered_free_rows"] or second.stats["empty_free_rows"] or second.stats["injection_error"]:
+                np.savez_compressed(Path(config["output_directory"]) / "data" /
+                    ("repair-second-%s-%s-r%03d.npz" % (os.environ.get("SLURM_JOB_ID", "local"), row["key"], p.rank)),
+                    native=first.native, raw_selected=second_mask,
+                    executed_markers=second.executed_markers, raw_uncovered=second.raw_uncovered)
+                if second.stats["repair_budget_exhausted"] or second.stats["uncovered_free_rows"] or second.stats["empty_free_rows"] or second.stats["injection_error"]:
                     failure = "second_interpolation_coverage_or_injection"
                 else:
                     space = Hierarchy(p, legacy, first, second, config["terminal_max_dofs"])
@@ -194,7 +234,7 @@ def main():
             teacher = dict(native=native, depth=depth, terminal_native=native[depth >= 5],
                            fixed=fixed, retained_entry=entry)
             data = replay.pcapply_snapshot(p, row, layout)
-            for method in ("amg", "retained_base", "teacher_multipass"):
+            for method in ("amg", "retained_base", "teacher_multipass_repaired"):
                 result = run_method(config, p, replay, legacy, bridge, row, layout, data, method, teacher)
                 result["key"] = key
                 results.append(result)

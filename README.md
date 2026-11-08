@@ -71,3 +71,11 @@ those dependencies with their provenance. A distribution licence has not yet
 been selected.
 
 The bridge preserves HYPRE special-F rows with no outgoing strong connections. They remain fine-smoother responsibilities. The gate independently checks these rows are also empty in the effective base; it does not waive coverage for other F rows.
+
+The fixed decoder can repair coverage by promoting uncovered rows, using native
+DOF IDs for deterministic distributed ties. It preserves all proposed C points,
+records original and executed markers separately, and caps additions by a
+configured fraction (plus the terminal size limit). Nine- and 99-hop diagnostics
+distinguish the native interpolation limit from longer/disconnected paths.
+A repair-budget failure remains a failed candidate; repaired points never
+replace raw policy actions in a REINFORCE log probability.
