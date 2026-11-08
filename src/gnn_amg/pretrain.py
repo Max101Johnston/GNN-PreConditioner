@@ -23,6 +23,7 @@ def examples(config):
     root = Path(config["output_directory"])
     job = str(config["dataset_job"])
     gate = read_json(root / "records" / ("gate-" + job + ".json"))
+    assert gate["config_sha256"] == config["dataset_config_sha256"]
     if not gate["passed"]:
         raise ValueError("Supervised dataset did not pass the numerical gate")
     inventory = read_json(Path(config["baseline_directory"]) / "data/inventory.json")

@@ -4,6 +4,7 @@ This module's feature functions also serve online inference. Only export_state
 reads teacher labels; graph_features and pooled_attributes are label-free.
 """
 from pathlib import Path
+import os
 import numpy as np
 
 from .backend import digest, graph_features, pooled_attributes, record
@@ -84,7 +85,7 @@ def export_state(config, p, bridge, row, layout, teacher, matrix, first, second)
             # In-degree prior is computed from the current graph only.
             incoming = np.bincount(arrays["indices"], weights=arrays["weights"], minlength=len(arrays["native"]))
             arrays["connection_prior"] = np.clip(np.log1p(incoming) - np.log(2), -2, 2).astype(np.float32)
-            path = Path(config["output_directory"]) / "data/supervised" / (row["key"] + "-level%d.npz" % stage)
+            path = Path(config["output_directory"]) / "data/supervised" / (os.environ.get("SLURM_JOB_ID", "local") + "-" + row["key"] + "-level%d.npz" % stage)
             with path.open("xb") as stream:
                 np.savez(stream, **arrays)
             results.append(dict(path=str(path), sha256=digest(path), stage=stage,
