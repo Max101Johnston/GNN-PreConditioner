@@ -175,3 +175,29 @@ uses the saved global update index, so continuation does not silently restart
 the schedule. Validation selection uses failure count and cumulative seconds,
 never the average of frame-wise speedup percentages. Saved-frame conclusions
 remain separate from actual restarted nonlinear time integration.
+
+## Parallel rollout allocation
+
+`parallel_workers=3`, `mpi_ranks=64` and `launch_mode=parallel_cpu` use one
+192-rank Slurm allocation. Three disjoint MPI communicators retain the accepted
+64-rank matrix ownership and RAS overlap, and evaluate three different states
+concurrently. Three resident policy replicas start from identical parameters.
+Each computes its state contribution divided by the full batch size; gradient
+sums are exchanged only after all state feedback is complete. Every replica
+then applies the same clipped gradient and Adam update. Matching parameter
+hashes are required before and after each update. This is one shared policy,
+not three independently trained policies.
+
+States have fixed worker assignments, so reference and candidate measurements
+use the same placement. One state is sampled from each worker's training slice.
+The marginal sampling probability is 1/(3*N_worker); weight 3*N_worker/55 keeps
+the objective equal to the uniform saved-state mean. Validation is unweighted
+across the same fixed eight states. Native interpolation, coarse solves,
+precision and maximum iterations do not change. Node-local MPI uses shared
+memory; TCP remains available between nodes.
+
+Each worker saves distinct action and checkpoint files. The canonical worker0
+checkpoint contains synchronized model and optimizer state. Per-worker sampling
+is seeded by the global update index and worker ID, making continuation explicit.
+Parallel training throughput is recorded separately from single-solve latency;
+a resource allocation is not by itself proof of a solver speed improvement.

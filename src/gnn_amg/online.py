@@ -168,6 +168,42 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     return result
 
 
+def split_solver_world(config, p):
+    """Independent 64-rank environments inside one Slurm/MPI allocation."""
+    workers = int(config.get("parallel_workers", 1))
+    p.global_world, p.global_rank, p.global_size = p.P(p.world.value), p.rank, p.size
+    p.worker = p.rank // config["mpi_ranks"]
+    assert p.size == workers*config["mpi_ranks"]
+    if workers > 1:
+        sub = p.P()
+        p.mpi.MPI_Comm_split.argtypes = [p.P, p.I, p.I, C.POINTER(p.P)]
+        p.mpi.MPI_Comm_split.restype = p.I
+        assert p.mpi.MPI_Comm_split(p.global_world, p.worker, p.rank, C.byref(sub)) == 0
+        p.world = sub
+        rank, size = p.I(), p.I()
+        assert p.mpi.MPI_Comm_rank(p.world, C.byref(rank)) == 0
+        assert p.mpi.MPI_Comm_size(p.world, C.byref(size)) == 0
+        p.rank, p.size = rank.value, size.value
+        assert p.size == config["mpi_ranks"]
+    return workers
+
+
+def global_objects(p, value):
+    """Exchange small root-only control/gradient payloads, never numerical matrices."""
+    payload = json.dumps(value, allow_nan=False).encode() if p.rank == 0 else b""
+    count = np.asarray([len(payload)], np.int32)
+    counts = np.empty(p.global_size, np.int32)
+    mpi_int = p.P(C.addressof((C.c_char*1).in_dll(p.mpi, "ompi_mpi_int")))
+    mpi_byte = p.P(C.addressof((C.c_char*1).in_dll(p.mpi, "ompi_mpi_byte")))
+    assert p.mpi.MPI_Allgather(count.ctypes.data, 1, mpi_int, counts.ctypes.data, 1, mpi_int, p.global_world) == 0
+    offsets = np.r_[0, np.cumsum(counts[:-1])].astype(np.int32)
+    source = np.frombuffer(payload, np.uint8)
+    target = np.empty(int(counts.sum()), np.uint8)
+    assert p.mpi.MPI_Allgatherv(source.ctypes.data, len(source), mpi_byte, target.ctypes.data,
+        counts.ctypes.data, offsets.ctypes.data, mpi_byte, p.global_world) == 0
+    return [json.loads(target[offset:offset+n].tobytes()) for offset, n in zip(offsets, counts) if n]
+
+
 def broadcast_json(p, value):
     payload = json.dumps(value, allow_nan=False).encode() if p.rank == 0 else b""
     count = int(p.reduce([len(payload)])[0])
@@ -200,6 +236,9 @@ def load_observed_state(config, p, replay, row):
 def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
     from .gate import run_method
     setting = config["training"]
+    workers = int(config.get("parallel_workers", 1))
+    if workers > 1:
+        assert workers == setting["batch_states"] == 3
     old, output = Path(config["baseline_directory"]), Path(config["output_directory"])
     job = os.environ.get("GNN_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
     receipt = read_json(config["prediction_acceptance"])
@@ -219,11 +258,18 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
         evaluation = [next(row for row in validation if row["key"] == key) for key in setting["validation_keys"]]
     assert 2 <= setting["batch_states"] <= 4 and len(training) >= setting["batch_states"]
     assert len({row["key"] for row in evaluation}) == len(evaluation)
+    assignment = {row["key"]: i % workers for i, row in enumerate(training)}
+    for i, row in enumerate(evaluation):
+        assignment.setdefault(row["key"], i % workers)
+    lanes = [[row for row in training if assignment[row["key"]] == i] for i in range(workers)]
+    assert all(lanes)
     started = time.perf_counter()
     deadline = started + setting["hours"]*3600
     references, reference_details, updates, checks = {}, {}, [], []
     def save_result(row, tag, result):
         if p.rank == 0:
+            result["worker"] = p.worker
+            result["solver_ranks"] = p.size
             path = output / "records" / ("rl-%s-%s-%s.json" % (job, row["key"], tag))
             with path.open("x") as f:
                 json.dump(result, f, allow_nan=False, indent=2)
@@ -238,6 +284,8 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
     # exists. References are constants; no training gradient enters them.
     reference_rows = {row["key"]: row for row in training+evaluation}
     for row in reference_rows.values():
+        if assignment[row["key"]] != p.worker:
+            continue
         layout, fields, data = load_observed_state(config, p, replay, row)
         result = run_method(config, p, replay, legacy, bridge, row, layout, data, "amg", None)
         assert result["reached_true_target"] and not result.get("timed_out"), "Reference AMG failed"
@@ -260,6 +308,11 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
         command(dict(operation="ping"))
         if p.rank == 0:
             record(config, "rl_reference_complete", key=row["key"], **reference_details[row["key"]])
+    if workers > 1:
+        collected = global_objects(p, dict(references=references, details=reference_details))
+        references = {key: value for part in collected for key, value in part["references"].items()}
+        reference_details = {key: value for part in collected for key, value in part["details"].items()}
+        assert len(references) == len(reference_rows)
     scale = setting.get("common_time_scale_s") or float(np.mean([references[row["key"]] for row in training]))
     if p.rank == 0:
         record(config, "rl_references_ready", job=job, common_scale=scale, count=len(references),
@@ -268,6 +321,8 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
     def evaluate(update, tag):
         cases = []
         for row in evaluation:
+            if assignment[row["key"]] != p.worker:
+                continue
             layout, fields, data = load_observed_state(config, p, replay, row)
             result = solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
                 context=dict(key=row["key"], training=False, tag=tag, update=update))
@@ -277,6 +332,11 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
                 failure=result["failure"], iterations=result.get("iterations"),
                 amg_seconds=references[row["key"]], retained_seconds=reference_details[row["key"]].get("retained_seconds")))
             close_data(data)
+        if workers > 1:
+            pieces = global_objects(p, cases)
+            by_key = {case["key"]: case for part in pieces for case in part}
+            assert len(by_key) == len(evaluation)
+            cases = [by_key[row["key"]] for row in evaluation]
         check = command(dict(operation="validation", cases=cases))
         checks.append(check)
         return check
@@ -285,6 +345,8 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
     stop_reason = "update_budget"
     while True:
         remaining = p.maximum(float(time.perf_counter() + (len(evaluation)+setting["batch_states"])*setting["episode_timeout_seconds"]+60 > deadline))
+        if workers > 1:
+            remaining = any(global_objects(p, bool(remaining)))
         if remaining:
             stop_reason = "wall_clock_budget"
             break
@@ -292,10 +354,15 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
         # Uniform without-replacement batches. Seed+global update makes exact
         # state sampling resumable without persisting a second hidden RNG.
         rng = np.random.default_rng(setting["seed"]+index)
-        batch = [training[int(i)] for i in rng.choice(len(training), setting["batch_states"], replace=False)]
+        if workers > 1:
+            batch = [lane[int(rng.integers(len(lane)))] for lane in lanes]
+        else:
+            batch = [training[int(i)] for i in rng.choice(len(training), setting["batch_states"], replace=False)]
         start = command(dict(operation="begin_batch", keys=[row["key"] for row in batch],
             common_scale=scale, reference_times=references))
         for row in batch:
+            if workers > 1 and assignment[row["key"]] != p.worker:
+                continue
             layout, fields, data = load_observed_state(config, p, replay, row)
             tag = "update%06d" % start["update"]
             result = solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
@@ -303,9 +370,25 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
             save_result(row, tag, result)
             command(dict(operation="feedback", key=row["key"], seconds=result["total_wall_s"],
                 converged=result["reached_true_target"] and result["failure"] is None,
-                failure=result["failure"], training_pool_size=len(training)))
+                failure=result["failure"], training_pool_size=len(training),
+                sampling_probability=1/(workers*len(lanes[p.worker])) if workers > 1 else 1/len(training),
+                importance=workers*len(lanes[p.worker])/len(training) if workers > 1 else 1.0))
             close_data(data)
+        if workers > 1:
+            partial = command(dict(operation="partial_gradient"))
+            pieces = global_objects(p, partial)
+            assert len(pieces) == workers
+            assert len({piece["parameter_sha256"] for piece in pieces}) == 1
+            assert all(piece["names"] == pieces[0]["names"] and piece["update"] == pieces[0]["update"] for piece in pieces)
+            gradient = np.sum(np.asarray([piece["gradient"] for piece in pieces], np.float64), axis=0)
+            observations = [ob for piece in pieces for ob in piece["observations"]]
+            command(dict(operation="merge_gradient", names=pieces[0]["names"], gradient=gradient.tolist(),
+                parameter_sha256=pieces[0]["parameter_sha256"], update=pieces[0]["update"], observations=observations))
         update = command(dict(operation="commit"))
+        if workers > 1:
+            replicas = global_objects(p, dict(worker=p.worker, parameter_sha256=update["parameter_sha256"], actions=update["actions"]))
+            assert len({replica["parameter_sha256"] for replica in replicas}) == 1, "Worker policies diverged"
+            update["worker_actions"] = replicas
         updates.append(update)
         if len(updates) == 1:
             assert update["parameter_delta_norm"] > 0 and update["gradient_norm"] > 0, "No actual policy update"
@@ -319,16 +402,18 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
         final_check = checks[-1] if checks else None
     final = rpc.close() if p.rank == 0 else None
     final = broadcast_json(p, final)
-    summary = dict(job=job, state="complete", smoke=smoke, stop_reason=stop_reason,
+    worker_finals = global_objects(p, dict(worker=p.worker, checkpoint=final["checkpoint"])) if workers > 1 else [dict(worker=0, checkpoint=final["checkpoint"])]
+    summary = dict(job=job, parallel_workers=workers, total_cpu_ranks=p.global_size, worker_checkpoints=worker_finals, state="complete", smoke=smoke, stop_reason=stop_reason,
         elapsed_seconds=p.maximum(time.perf_counter()-started), updates=len(updates),
         total_updates=updates[-1]["update"] if updates else setting.get("initial_updates", 0),
         common_time_scale_s=scale, training_states=len(training), evaluation_states=len(evaluation),
         evaluation_split="training-smoke" if smoke else "validation", final_checkpoint=final["checkpoint"],
         final_check=final_check, validation_checks=checks,
         real_updates=[dict(update=u["update"], phase=u["phase"], gradient_norm=u["gradient_norm"],
-            parameter_delta_norm=u["parameter_delta_norm"], observations=u["observations"], actions=u["actions"]) for u in updates],
+            parameter_delta_norm=u["parameter_delta_norm"], observations=u["observations"], actions=u["actions"],
+            worker_actions=u.get("worker_actions")) for u in updates],
         next="Inspect exact checkpoint resume and residuals, then start24hRL" if smoke else "Assess cumulative validation cost and convergence before autonomous continuation")
-    if p.rank == 0:
+    if p.global_rank == 0:
         (output / "records" / ("rl-"+job+".json")).write_text(json.dumps(summary, indent=2, allow_nan=False)+"\n")
         record(config, "rl_complete", job=job, smoke=smoke, updates=len(updates),
             seconds=summary["elapsed_seconds"], checkpoint=final["checkpoint"], final_check=final_check)
@@ -345,8 +430,13 @@ def main():
     config = read_json(args.config)
     replay, legacy = load_dependencies(config)
     p = replay.Petsc()
+    workers = split_solver_world(config, p)
+    if workers > 1:
+        config["progress_name"] = "progress-%s-worker%d.jsonl" % (os.environ.get("SLURM_JOB_ID", "local"), p.worker)
     replay.pcapply_bind(p)
-    assert p.size == config["mpi_ranks"] == 64
+    assert p.size == config["mpi_ranks"]
+    if config["stage"] != "parallel_smoke":
+        assert p.size == 64
     bridge = load_bridge(p, config["bridge"])
     old, output = Path(config["baseline_directory"]), Path(config["output_directory"])
     job = os.environ.get("GNN_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
@@ -354,8 +444,16 @@ def main():
     try:
         from .gate import numerical_smoke, run_method
         numerical_smoke(config, p, legacy, bridge)
+        if config["stage"] == "parallel_smoke":
+            receipts = global_objects(p, dict(worker=p.worker, ranks=p.size, value=p.maximum(p.worker+1)))
+            assert len(receipts) == workers and [r["value"] for r in receipts] == list(range(1, workers+1))
+            if p.global_rank == 0:
+                record(config, "parallel_communicators_passed", total_ranks=p.global_size, workers=receipts)
+            p.call("PetscFinalize")
+            return 0
         if p.rank == 0:
-            rpc = PolicyClient(args.endpoint)
+            endpoint = Path(str(args.endpoint)+"-worker%d" % p.worker) if workers > 1 else args.endpoint
+            rpc = PolicyClient(endpoint)
         assert digest(old / "data/inventory.json") == config["inventory_sha256"]
         inventory = read_json(old / "data/inventory.json")
         if config["stage"] == "rl":
@@ -421,7 +519,7 @@ def main():
     except BaseException:
         import traceback
         traceback.print_exc()
-        p.mpi.MPI_Abort(p.world, 1)
+        p.mpi.MPI_Abort(getattr(p, "global_world", p.world), 1)
         raise
 
 

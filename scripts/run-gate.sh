@@ -37,58 +37,75 @@ unset PETSC_OPTIONS SINGULARITYENV_PETSC_OPTIONS
 if [[ "$(cfg stage)" == "pretrain" ]]; then
     export LD_LIBRARY_PATH="$(cfg cuda_toolkit)/lib64:${LD_LIBRARY_PATH:-}"
     "$(cfg torch_python)" -B -m gnn_amg.pretrain "$config"
-elif [[ "$(cfg stage)" == "prediction" || "$(cfg stage)" == "rl" ]]; then
+elif [[ "$(cfg stage)" == "prediction" || "$(cfg stage)" == "rl" || "$(cfg stage)" == "parallel_smoke" ]]; then
     export GNN_RUN_ID="${SLURM_JOB_ID_HET_GROUP_0:-$SLURM_JOB_ID}"
     export SINGULARITYENV_GNN_RUN_ID="$GNN_RUN_ID"
     endpoint="$task/records/rpc-$GNN_RUN_ID.json"
-    gpu_pid=""
+    workers=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("parallel_workers",1))' "$config")
+    policy_pids=()
     stop_gpu() {
-        if [[ -n "$gpu_pid" ]]; then
-            kill -TERM "$gpu_pid" 2>/dev/null || true
-            wait "$gpu_pid" 2>/dev/null || true
-            gpu_pid=""
-        fi
+        for pid in "${policy_pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+        for pid in "${policy_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+        policy_pids=()
     }
     trap stop_gpu EXIT
-    if [[ "$(cfg launch_mode)" == "single_node" ]]; then
-        "$(cfg torch_python)" -B -m gnn_amg.inference "$config" "$endpoint" &
-        gpu_pid=$!
-    else
-        srun --het-group=1 --exact --nodes=1 --ntasks=1 --cpus-per-task="$(cfg gpu_cpu_threads)" \
-            env LD_LIBRARY_PATH="$(cfg cuda_toolkit)/lib64:${LD_LIBRARY_PATH:-}" \
+    if [[ "$(cfg stage)" != "parallel_smoke" ]]; then
+        if [[ "$(cfg launch_mode)" == "parallel_cpu" ]]; then
+            for ((worker=0; worker<workers; worker++)); do
+                GNN_POLICY_WORKER="$worker" "$(cfg torch_python)" -B -m gnn_amg.inference "$config" "$endpoint-worker$worker" &
+                policy_pids+=("$!")
+            done
+        elif [[ "$(cfg launch_mode)" == "single_node" ]]; then
             "$(cfg torch_python)" -B -m gnn_amg.inference "$config" "$endpoint" &
-        gpu_pid=$!
-    fi
-    python3 - "$endpoint" <<'READY'
+            policy_pids+=("$!")
+        else
+            srun --het-group=1 --exact --nodes=1 --ntasks=1 --cpus-per-task="$(cfg gpu_cpu_threads)" \
+                env LD_LIBRARY_PATH="$(cfg cuda_toolkit)/lib64:${LD_LIBRARY_PATH:-}" \
+                "$(cfg torch_python)" -B -m gnn_amg.inference "$config" "$endpoint" &
+            policy_pids+=("$!")
+        fi
+        python3 - "$endpoint" "$workers" <<'READY'
 from pathlib import Path
 import sys,time
-path=Path(sys.argv[1]);deadline=time.monotonic()+300
-while not path.exists():
-    if time.monotonic()>deadline:raise TimeoutError('Policy endpoint not ready')
+base=sys.argv[1];workers=int(sys.argv[2]);deadline=time.monotonic()+300
+paths=[Path(base+('-worker%d'%i if workers>1 else '')) for i in range(workers)]
+while not all(path.exists() for path in paths):
+    if time.monotonic()>deadline:raise TimeoutError('Policy endpoints not ready')
     time.sleep(.5)
 READY
+    fi
     net=$(cfg mpi_tcp_interface)
-    cpu_host=$(scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_0:-$SLURM_JOB_NODELIST}")
-    [[ "$cpu_host" != *$'\n'* ]]
+    if [[ "$(cfg launch_mode)" == "parallel_cpu" ]]; then
+        mpi=(mpirun --mca plm slurm --mca ras slurm --map-by slot --tag-output --bind-to core)
+    else
+        cpu_host=$(scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_0:-$SLURM_JOB_NODELIST}")
+        [[ "$cpu_host" != *$'\n'* ]]
+        mpi=(mpirun --mca plm isolated --mca ras ^slurm --tag-output --bind-to core --host "$cpu_host:$(cfg mpi_ranks)")
+    fi
     export SINGULARITYENV_OMPI_MCA_btl_tcp_if_include="$net"
     export SINGULARITYENV_OMPI_MCA_oob_tcp_if_include="$net"
     mpi_status=0
     timeout --signal=TERM --kill-after=30 "$(cfg mpi_timeout_seconds)" \
-        mpirun --mca plm isolated --mca ras ^slurm --tag-output --bind-to core --host "$cpu_host:$(cfg mpi_ranks)" \
-        --mca btl self,tcp --mca btl_tcp_if_include "$net" --mca oob_tcp_if_include "$net" \
-        -np "$(cfg mpi_ranks)" singularity exec -B "$(cfg remote_root)" "$(cfg image)" \
+        "${mpi[@]}" --mca btl self,vader,tcp --mca btl_tcp_if_include "$net" --mca oob_tcp_if_include "$net" \
+        -np "$((workers*$(cfg mpi_ranks)))" singularity exec -B "$(cfg remote_root)" "$(cfg image)" \
         /opt/ogs/bin/python3 -B -m gnn_amg.online "$config" "$endpoint" < /dev/null || mpi_status=$?
     if ((mpi_status!=0)); then
         stop_gpu
-        printf '[workers] MPI exit: %s; Policy service stopped after MPI failure\n' "$mpi_status"
+        printf '[workers] MPI exit: %s; Policy services stopped after MPI failure\n' "$mpi_status"
         exit "$mpi_status"
     fi
-    gpu_status=0
-    wait "$gpu_pid" || gpu_status=$?
-    gpu_pid=""
+    service_status=0
+    statuses=()
+    for pid in "${policy_pids[@]}"; do
+        code=0
+        wait "$pid" || code=$?
+        statuses+=("$code")
+        if ((code!=0)); then service_status=$code; fi
+    done
+    policy_pids=()
     trap - EXIT
-    printf '[workers] MPI exit: %s; Policy service exit: %s\n' "$mpi_status" "$gpu_status"
-    if ((gpu_status!=0)); then exit "$gpu_status"; fi
+    printf '[workers] MPI exit: %s; Policy service exits: %s\n' "$mpi_status" "${statuses[*]}"
+    if ((service_status!=0)); then exit "$service_status"; fi
 else
 net=$(cfg mpi_tcp_interface)
 export SINGULARITYENV_OMPI_MCA_btl_tcp_if_include="$net"

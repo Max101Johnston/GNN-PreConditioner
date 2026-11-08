@@ -255,6 +255,8 @@ class PolicyLearner:
             self.reference_times = saved.get("reference_times", {})
             self.validation_round = saved.get("validation_round", 0)
         self.initial_update = self.update
+        self.worker = int(os.environ.get("GNN_POLICY_WORKER", "0"))
+        self.worker_suffix = "-worker%d" % self.worker if config.get("parallel_workers", 1) > 1 else ""
 
     def identity(self):
         import hashlib
@@ -276,6 +278,11 @@ class PolicyLearner:
         if self.common_scale is not None and scale != self.common_scale:
             raise ValueError("The reward scale changed during training")
         self.common_scale = scale
+        if self.config.get("parallel_workers", 1) > 1:
+            import torch
+            seed = self.settings["seed"] + 1009*self.update + self.worker
+            self.rng = np.random.default_rng(seed)
+            torch.manual_seed(seed)
         self.reference_times = request["reference_times"]
         second, first = self.settings["phase_updates"]
         self.phase = "second" if self.update < second else ("first" if self.update < second+first else "joint")
@@ -335,14 +342,48 @@ class PolicyLearner:
         past = self.baseline.get(key)
         loss_value = None
         if samples:
-            loss = reinforce_loss([dict(key=key, reward=reward, samples=samples, importance=1.0)], self.baseline)/len(self.keys)
+            loss = reinforce_loss([dict(key=key, reward=reward, samples=samples, importance=request.get("importance", 1.0))], self.baseline)/len(self.keys)
             loss_value = float(loss.detach())
             loss.backward()
         observation = dict(key=key, reward=reward, past_baseline=past, samples=len(samples),
             seconds=request["seconds"], converged=request["converged"], failure=request.get("failure"),
-            loss=loss_value, sampling_probability=1/request["training_pool_size"], importance=1.0)
+            loss=loss_value, sampling_probability=request.get("sampling_probability", 1/request["training_pool_size"]),
+            importance=request.get("importance", 1.0))
         self.observations.append(observation)
         return observation
+
+    def partial_gradient(self):
+        if self.pending or len(self.observations) != 1:
+            raise RuntimeError("Each parallel worker must complete exactly one state")
+        flat, names = [], []
+        for name, parameter in self.model.named_parameters():
+            if parameter.requires_grad:
+                names.append((name, list(parameter.shape)))
+                value = parameter.grad
+                flat.extend((value.detach().cpu().numpy().ravel() if value is not None else np.zeros(parameter.numel())).tolist())
+        return dict(names=names, gradient=flat, observations=self.observations,
+            parameter_sha256=self.identity(), update=self.update, worker=self.worker)
+
+    def merge_gradient(self, request):
+        import torch
+        if request["parameter_sha256"] != self.identity() or request["update"] != self.update:
+            raise ValueError("Cannot merge gradients from stale parameters")
+        values = np.asarray(request["gradient"], np.float32)
+        offset = 0
+        names = []
+        for name, parameter in self.model.named_parameters():
+            if parameter.requires_grad:
+                names.append([name, list(parameter.shape)])
+                count = parameter.numel()
+                parameter.grad = torch.as_tensor(values[offset:offset+count].reshape(tuple(parameter.shape)), device=self.device).clone()
+                offset += count
+        if offset != len(values) or names != request["names"]:
+            raise ValueError("Incompatible parallel gradient layout")
+        observations = request["observations"]
+        if sorted(r["key"] for r in observations) != sorted(self.keys):
+            raise ValueError("Parallel batch has missing or duplicate states")
+        self.observations = observations
+        return dict(merged=True, worker=self.worker)
 
     def commit(self):
         import torch
@@ -357,10 +398,10 @@ class PolicyLearner:
         self.update += 1
         run = os.environ.get("GNN_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
         root = Path(self.config["output_directory"])
-        path = root / "data" / ("rl-%s-update%06d-actions.npz" % (run, self.update))
+        path = root / "data" / ("rl-%s-update%06d%s-actions.npz" % (run, self.update, self.worker_suffix))
         with path.open("xb") as f:
             np.savez_compressed(f, **self.action_arrays)
-        result = dict(update=self.update, phase=self.phase, parameter_sha256=self.identity(), gradient_norm=float(gradient),
+        result = dict(update=self.update, worker=self.worker, phase=self.phase, parameter_sha256=self.identity(), gradient_norm=float(gradient),
             parameter_delta_norm=float(np.sqrt(sum(v*v for v in changes.values()))),
             parameter_changes=changes, observations=self.observations, common_scale=self.common_scale,
             actions=dict(path=str(path), sha256=digest(path)), frozen_parameters_until_batch_complete=True)
@@ -368,14 +409,14 @@ class PolicyLearner:
         if self.update == 1 or self.update % self.settings["checkpoint_interval"] == 0:
             result["checkpoint"] = self.checkpoint("update")
         record(self.config, "rl_update_complete", **result)
-        (root / "records" / ("rl-"+run+".json")).write_text(json.dumps(dict(state="running", latest=result,
+        (root / "records" / ("rl-"+run+self.worker_suffix+".json")).write_text(json.dumps(dict(state="running", latest=result,
             best=self.best, updates_this_allocation=self.update-self.initial_update), indent=2)+"\n")
         return result
 
     def checkpoint(self, tag):
         import torch
         run = os.environ.get("GNN_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
-        path = Path(self.config["output_directory"]) / "checkpoints" / ("rl-%s-update%06d-%s.pt" % (run, self.update, tag))
+        path = Path(self.config["output_directory"]) / "checkpoints" / ("rl-%s-update%06d%s-%s.pt" % (run, self.update, self.worker_suffix, tag))
         if path.exists():
             raise FileExistsError(path)
         if tag.startswith("validation") and self.best is not None:
@@ -419,10 +460,12 @@ def serve(config, endpoint):
     use_cuda = device.type == "cuda"
     if use_cuda and not torch.cuda.is_available():
         raise RuntimeError("Configured CUDA policy device is unavailable")
-    if not use_cuda and config.get("launch_mode") == "single_node":
+    if not use_cuda and config.get("launch_mode") in ("single_node", "parallel_cpu"):
         # MPI rank0 waits on the socket during inference, so share its first
         # allocated core rather than requesting a second resource group.
-        os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
+        available = sorted(os.sched_getaffinity(0))
+        worker = int(os.environ.get("GNN_POLICY_WORKER", "0"))
+        os.sched_setaffinity(0, {available[worker % len(available)]})
     torch.set_num_threads(config["gpu_cpu_threads"])
     torch.backends.cuda.matmul.allow_tf32 = False
     assert digest(config["policy_checkpoint"]) == config["policy_checkpoint_sha256"]
@@ -468,10 +511,12 @@ def serve(config, endpoint):
             if request["operation"] == "ping":
                 send_packet(stream, dict(alive=True))
                 continue
-            if learner is not None and request["operation"] in ("begin_batch", "feedback", "commit", "validation"):
+            if learner is not None and request["operation"] in ("begin_batch", "feedback", "commit", "validation", "partial_gradient", "merge_gradient"):
                 operation = request["operation"]
                 reply = (learner.begin(request) if operation == "begin_batch" else
                          learner.feedback(request) if operation == "feedback" else
+                         learner.partial_gradient() if operation == "partial_gradient" else
+                         learner.merge_gradient(request) if operation == "merge_gradient" else
                          learner.commit() if operation == "commit" else learner.validation(request))
                 send_packet(stream, reply)
                 continue
@@ -537,4 +582,7 @@ if __name__ == "__main__":
     parser.add_argument("config", type=Path)
     parser.add_argument("endpoint", type=Path)
     args = parser.parse_args()
-    serve(read_json(args.config), args.endpoint)
+    config = read_json(args.config)
+    if config.get("parallel_workers", 1) > 1:
+        config["progress_name"] = "progress-%s-policy%s.jsonl" % (os.environ.get("SLURM_JOB_ID", "local"), os.environ["GNN_POLICY_WORKER"])
+    serve(config, args.endpoint)

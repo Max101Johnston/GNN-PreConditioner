@@ -130,5 +130,67 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(torch.equal(torch.get_rng_state(), checkpoint["rng_torch"]))
 
 
+    def test_parallel_replicas_apply_one_identical_weighted_update(self):
+        import contextlib
+        import copy
+        import io
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        import numpy as np
+        from scipy import sparse
+        from gnn_amg.inference import PolicyLearner
+        root = Path(tempfile.mkdtemp(prefix="gnn-parallel-test-"))
+        for name in ("records", "data", "checkpoints"):
+            (root/name).mkdir()
+        settings = dict(seed=91, learning_rate=1e-3, phase_updates=[20, 20],
+            exploration_dofs=[4, 4], reference_probability=.8, sampling_temperature=1.,
+            episode_timeout_seconds=10., gradient_clip=1., checkpoint_interval=20)
+        config = dict(training=settings, output_directory=str(root), parallel_workers=3)
+        saved = dict(feature_names=list("abcde"), feature_mean=np.zeros((2, 5)),
+            feature_scale=np.ones((2, 5)), coarse_fraction=np.array([.1, .1]), dataset_job="test")
+        torch.manual_seed(17)
+        template = TwoStagePolicy(5)
+        n = 9
+        graph = sparse.diags([np.ones(n-1), np.ones(n-1)], [-1, 1], shape=(n, n)).tocsr()
+        features = np.arange(n*5, dtype=np.float32).reshape(n, 5)/13
+        arrays = dict(native=np.arange(n), eligible=np.ones(n, bool), features=features,
+            indptr=graph.indptr, indices=graph.indices)
+        tensor_graph = torch.tensor(graph.toarray(), dtype=torch.float32).to_sparse_csr()
+        replicas, pieces = [], []
+        for worker, key in enumerate(("a", "b", "c")):
+            with patch.dict("os.environ", {"GNN_POLICY_WORKER": str(worker)}):
+                learner = PolicyLearner(config, copy.deepcopy(template), torch.device("cpu"), saved)
+            learner.begin(dict(keys=["a", "b", "c"], common_scale=2., reference_times=dict(a=6., b=6., c=6.)))
+            logits = learner.model(torch.tensor(features), tensor_graph, torch.zeros(n), 1)
+            learner.sample(dict(key=key, stage=1), logits, np.arange(n) % 3 == 0, arrays)
+            lane_size = [19, 18, 18][worker]
+            learner.feedback(dict(key=key, seconds=2.+worker, converged=True, training_pool_size=55,
+                sampling_probability=1/(3*lane_size), importance=3*lane_size/55))
+            self.assertEqual(learner.identity(), replicas[0].identity() if replicas else learner.identity())
+            replicas.append(learner)
+            pieces.append(json.loads(json.dumps(learner.partial_gradient())))
+        merged = dict(names=pieces[0]["names"],
+            gradient=np.asarray([p["gradient"] for p in pieces]).sum(axis=0).tolist(),
+            parameter_sha256=pieces[0]["parameter_sha256"], update=0,
+            observations=[row for p in pieces for row in p["observations"]])
+        with self.assertRaises(ValueError):
+            replicas[0].merge_gradient(dict(merged, parameter_sha256="stale"))
+        results = []
+        for replica in replicas:
+            replica.merge_gradient(merged)
+            with contextlib.redirect_stdout(io.StringIO()):
+                results.append(replica.commit())
+        self.assertEqual(len({r["parameter_sha256"] for r in results}), 1)
+        self.assertEqual(len({r["actions"]["path"] for r in results}), 3)
+        self.assertTrue(all(r["update"] == 1 and r["parameter_delta_norm"] > 0 for r in results))
+        for replica in replicas[1:]:
+            self.assertEqual(replica.baseline.values, replicas[0].baseline.values)
+            for key, values in replicas[0].optimizer.state_dict()["state"].items():
+                for name, value in values.items():
+                    torch.testing.assert_close(replica.optimizer.state_dict()["state"][key][name], value, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

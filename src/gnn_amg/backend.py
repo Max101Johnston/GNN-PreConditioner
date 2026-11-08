@@ -38,7 +38,7 @@ def load_dependencies(config):
 
 def record(config, event, **values):
     row = dict(event=event, unix_time=time.time(), **values)
-    with (Path(config["output_directory"]) / "records/progress.jsonl").open("a") as stream:
+    with (Path(config["output_directory"]) / "records" / config.get("progress_name", "progress.jsonl")).open("a") as stream:
         stream.write(json.dumps(row, allow_nan=False) + "\n")
         stream.flush()
     print("GNN", json.dumps(row, allow_nan=False), flush=True)
