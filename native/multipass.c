@@ -245,3 +245,79 @@ cleanup:
     return err;
 #undef TRY
 }
+
+/* Export the SAME directed HYPRE strength topology used by interpolation.
+ * Edge weights are |K_ij| normalized over the strong outgoing neighbours.
+ * Features: log|diag|, log absolute row sum, negative/positive fractions,
+ * log(1+strong degree), off-rank fraction, diagonal fraction and diagonal sign.
+ * No C/F selection, teacher hierarchy or solver setup is performed. */
+PetscErrorCode gnn_graph(Mat a, const int *functions, double strength,
+                         Mat *graph, double *features)
+{
+    Mat hmat = NULL;
+    hypre_ParCSRMatrix *h = NULL, *s = NULL;
+    PetscErrorCode err = 0;
+    double *lookup_d = NULL, *lookup_o = NULL;
+    *graph = NULL;
+#define GRAPH_TRY(call) do { err = (call); if (err) goto cleanup; } while (0)
+    GRAPH_TRY(MatConvert(a, MATHYPRE, MAT_INITIAL_MATRIX, &hmat));
+    GRAPH_TRY(MatHYPREGetParCSR(hmat, &h));
+    GRAPH_TRY(hypre_BoomerAMGCreateS(h, strength, 0.9, 3, (int *)functions, &s));
+    hypre_CSRMatrix *ad = hypre_ParCSRMatrixDiag(h), *ao = hypre_ParCSRMatrixOffd(h);
+    hypre_CSRMatrix *sd = hypre_ParCSRMatrixDiag(s), *so = hypre_ParCSRMatrixOffd(s);
+    int m = hypre_CSRMatrixNumRows(ad);
+    lookup_d = calloc(m ? m : 1, sizeof(double));
+    int no = hypre_CSRMatrixNumCols(ao);
+    lookup_o = calloc(no ? no : 1, sizeof(double));
+    hypre_CSRMatrixData(sd) = hypre_CTAlloc(HYPRE_Complex, hypre_CSRMatrixNumNonzeros(sd), HYPRE_MEMORY_HOST);
+    hypre_CSRMatrixData(so) = hypre_CTAlloc(HYPRE_Complex, hypre_CSRMatrixNumNonzeros(so), HYPRE_MEMORY_HOST);
+    int ok = lookup_d && lookup_o && (hypre_CSRMatrixData(sd) || !hypre_CSRMatrixNumNonzeros(sd))
+             && (hypre_CSRMatrixData(so) || !hypre_CSRMatrixNumNonzeros(so)), all_ok;
+    GRAPH_TRY(MPI_Allreduce(&ok, &all_ok, 1, MPI_INT, MPI_MIN, hypre_ParCSRMatrixComm(h)));
+    if (!all_ok) { err = 55; goto cleanup; }
+    for (int i = 0; i < m; ++i)
+    {
+        double diagonal = 0, negative = 0, positive = 0, total = 0, strong = 0;
+        for (int j = hypre_CSRMatrixI(ad)[i]; j < hypre_CSRMatrixI(ad)[i+1]; ++j)
+        {
+            int c = hypre_CSRMatrixJ(ad)[j];
+            double value = hypre_CSRMatrixData(ad)[j];
+            lookup_d[c] = fabs(value);
+            if (c == i) diagonal = value;
+            else { negative += fmax(-value, 0); positive += fmax(value, 0); }
+            total += fabs(value);
+        }
+        for (int j = hypre_CSRMatrixI(ao)[i]; j < hypre_CSRMatrixI(ao)[i+1]; ++j)
+        {
+            double value = hypre_CSRMatrixData(ao)[j];
+            lookup_o[hypre_CSRMatrixJ(ao)[j]] = fabs(value);
+            negative += fmax(-value, 0); positive += fmax(value, 0); total += fabs(value);
+        }
+        for (int j = hypre_CSRMatrixI(sd)[i]; j < hypre_CSRMatrixI(sd)[i+1]; ++j)
+            strong += lookup_d[hypre_CSRMatrixJ(sd)[j]];
+        for (int j = hypre_CSRMatrixI(so)[i]; j < hypre_CSRMatrixI(so)[i+1]; ++j)
+            strong += lookup_o[hypre_CSRMatrixJ(so)[j]];
+        for (int j = hypre_CSRMatrixI(sd)[i]; j < hypre_CSRMatrixI(sd)[i+1]; ++j)
+            hypre_CSRMatrixData(sd)[j] = lookup_d[hypre_CSRMatrixJ(sd)[j]] / fmax(strong, 1e-300);
+        for (int j = hypre_CSRMatrixI(so)[i]; j < hypre_CSRMatrixI(so)[i+1]; ++j)
+            hypre_CSRMatrixData(so)[j] = lookup_o[hypre_CSRMatrixJ(so)[j]] / fmax(strong, 1e-300);
+        int off = hypre_CSRMatrixI(so)[i+1] - hypre_CSRMatrixI(so)[i];
+        int degree = off + hypre_CSRMatrixI(sd)[i+1] - hypre_CSRMatrixI(sd)[i];
+        features[8*i] = log10(fmax(fabs(diagonal), 1e-30));
+        features[8*i+1] = log10(fmax(total, 1e-30));
+        features[8*i+2] = negative / fmax(total, 1e-300);
+        features[8*i+3] = positive / fmax(total, 1e-300);
+        features[8*i+4] = log1p(degree);
+        features[8*i+5] = ((double)off) / (degree ? degree : 1);
+        features[8*i+6] = diagonal / fmax(total, 1e-300);
+        features[8*i+7] = diagonal > 0 ? 1 : (diagonal < 0 ? -1 : 0);
+    }
+    GRAPH_TRY(import_parcsr(s, graph));
+cleanup:
+    free(lookup_d); free(lookup_o);
+    if (s) hypre_ParCSRMatrixDestroy(s);
+    if (hmat) MatDestroy(&hmat);
+    if (err && *graph) MatDestroy(graph);
+    return err;
+#undef GRAPH_TRY
+}

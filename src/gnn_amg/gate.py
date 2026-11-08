@@ -13,7 +13,7 @@ import time
 import numpy as np
 
 from .backend import (Action, Hierarchy, Level, digest, load_bridge,
-                      load_dependencies, read_json, record)
+                      load_dependencies, read_json, record, graph_features, pooled_attributes)
 
 
 def numerical_smoke(config, p, legacy, bridge):
@@ -48,6 +48,23 @@ def numerical_smoke(config, p, legacy, bridge):
         record(config, "native_mpi_smoke_passed", ranks=p.size,
             empty_coarse_ranks=int(np.sum(np.diff(level.owners) == 0)),
             galerkin_relative=relative, interpolation=level.stats)
+    attributes = np.column_stack([np.ones(3), np.arange(lo, hi), np.arange(lo, hi)**2])
+    means, mass = pooled_attributes(p, level, attributes)
+    assert np.allclose(means[:, 0], 1) and np.all(mass > 0)
+    features, graph, graph_owners = graph_features(p, bridge, distributed.matrix,
+        (native % 3).astype(np.int32), attributes, np.zeros(3, bool), 0, np.ones(3))
+    expected = matrix.copy()
+    expected.setdiag(0)
+    expected.eliminate_zeros()
+    expected.data = np.abs(expected.data)
+    row_sum = np.asarray(expected.sum(axis=1)).ravel()
+    expected = sp.diags(1/np.maximum(row_sum, 1e-30)) @ expected
+    difference = graph - expected[lo:hi]
+    assert not difference.nnz or np.max(np.abs(difference.data)) < 1e-14
+    assert np.array_equal(graph_owners, owners)
+    np.testing.assert_allclose(features[:, attributes.shape[1]], np.log10(2), atol=1e-7)
+    if p.rank == 0:
+        record(config, "actual_strength_graph_and_support_pooling_smoke_passed", ranks=p.size)
     level.close()
     distributed.close()
     if p.size >= 20:
@@ -150,6 +167,9 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
             stats["galerkin_errors"] = space.parity(fine)
             if max(stats["galerkin_errors"]) > 1e-9:
                 failure = "galerkin_identity"
+            if config.get("export_supervised") and first is not None and failure is None:
+                from .dataset import export_state
+                stats["supervised_files"] = export_state(config, p, bridge, row, layout, teacher, k, first, second)
 
             def action(v, z):
                 residual = p.array(v)
@@ -205,7 +225,9 @@ def main():
         assert digest(old / "data/inventory.json") == config["inventory_sha256"]
         inventory = read_json(old / "data/inventory.json")
         results = []
-        for key in config["gate_keys"]:
+        keys = ([r["key"] for r in inventory["snapshots"] if r["split"] == "training"]
+                if config.get("export_supervised") else config["gate_keys"])
+        for key in keys:
             row = next(r for r in inventory["snapshots"] if r["key"] == key)
             assert row["split"] == "training", "Gate may not tune on validation/test states"
             if p.rank == 0:
@@ -234,7 +256,8 @@ def main():
             teacher = dict(native=native, depth=depth, terminal_native=native[depth >= 5],
                            fixed=fixed, retained_entry=entry)
             data = replay.pcapply_snapshot(p, row, layout)
-            for method in ("amg", "retained_base", "teacher_multipass_repaired"):
+            methods = ("teacher_multipass_repaired",) if config.get("export_supervised") else ("amg", "retained_base", "teacher_multipass_repaired")
+            for method in methods:
                 result = run_method(config, p, replay, legacy, bridge, row, layout, data, method, teacher)
                 result["key"] = key
                 results.append(result)

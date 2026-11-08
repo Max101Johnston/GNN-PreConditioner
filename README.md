@@ -79,3 +79,24 @@ configured fraction (plus the terminal size limit). Nine- and 99-hop diagnostics
 distinguish the native interpolation limit from longer/disconnected paths.
 A repair-budget failure remains a failed candidate; repaired points never
 replace raw policy actions in a REINFORCE log probability.
+
+`gnn_amg.dataset` exports supervised material from the accepted raw labels and
+the actually built direct-multipass K1. Fine features contain current phase
+field, degradation, moduli, porosity/Biot terms, aperture and normalized geometry.
+Coarse physical features are fixed |P1|-weighted support statistics, including
+phi and phi squared. Both graphs use the exact HYPRE strength topology with
+normalized absolute stiffness weights; matrix sign/scale and MPI-boundary
+information are observable features. No teacher information enters feature
+construction. Original and repaired teacher labels are stored separately.
+
+Set `export_supervised` in the external gate configuration to export the training
+split only and verify every resulting full solve. Validation and final-test
+frames are not exported by this preparation step. Generated NPZ files are
+offline training material; their construction cost must still be measured in
+the online inference path.
+
+`gnn_amg.pretrain` verifies the successful dataset receipts, fits feature scaling
+using training examples only, and trains the shared network on one CUDA device.
+It stores an immutable checkpoint after every epoch, including optimizer and
+random-generator states. Raw-label recall is diagnostic; none of these
+checkpoints is accepted until independent predicted-C full solves pass.

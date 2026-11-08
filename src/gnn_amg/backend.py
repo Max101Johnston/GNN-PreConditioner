@@ -201,3 +201,61 @@ def load_bridge(p, path):
                                     C.POINTER(p.P), C.POINTER(p.P), p.P]
     bridge.gnn_multipass.restype = p.I
     return bridge
+
+
+def local_csr(p, matrix):
+    """Copy owned rows only; global column numbers preserve MPI-boundary edges."""
+    from scipy.sparse import csr_matrix
+    owners = ownership(p, matrix)
+    lo, hi = map(int, owners[p.rank:p.rank+2])
+    n, width = p.I(), p.I()
+    p.call("MatGetSize", matrix, C.byref(n), C.byref(width))
+    indptr, indices, data = [0], [], []
+    for row in range(lo, hi):
+        count, columns, values = p.I(), p.P(), p.P()
+        p.call("MatGetRow", matrix, row, C.byref(count), C.byref(columns), C.byref(values))
+        if count.value:
+            indices.append(np.ctypeslib.as_array(C.cast(columns, C.POINTER(p.I)), shape=(count.value,)).copy())
+            data.append(np.ctypeslib.as_array(C.cast(values, C.POINTER(p.D)), shape=(count.value,)).copy())
+        indptr.append(indptr[-1] + count.value)
+        p.call("MatRestoreRow", matrix, row, C.byref(count), C.byref(columns), C.byref(values))
+    return csr_matrix((np.concatenate(data) if data else np.empty(0),
+                       np.concatenate(indices) if indices else np.empty(0, np.int32),
+                       np.asarray(indptr, dtype=np.int32)), shape=(hi-lo, width.value)), owners
+
+
+def graph_features(p, bridge, matrix, components, attributes, constrained, stage, support, strength=0.25):
+    """Observable physical and numerical inputs; no teacher information."""
+    graph = p.P()
+    functions = np.ascontiguousarray(components, dtype=np.int32)
+    algebra = np.empty((len(functions), 8), dtype=np.float64)
+    bridge.gnn_graph.argtypes = [p.P, p.P, p.D, C.POINTER(p.P), p.P]
+    bridge.gnn_graph.restype = p.I
+    code = bridge.gnn_graph(matrix, functions.ctypes.data, strength, C.byref(graph), algebra.ctypes.data)
+    if code:
+        raise RuntimeError("Graph export error %d" % code)
+    adjacency, owners = local_csr(p, graph)
+    p.destroy("Mat", graph)
+    features = np.column_stack([attributes, algebra, np.eye(3)[components],
+        constrained.astype(float), np.full(len(functions), stage), np.log1p(support)]).astype(np.float32)
+    assert np.isfinite(features).all() and np.isfinite(adjacency.data).all()
+    sums = np.asarray(adjacency.sum(axis=1)).ravel()
+    assert np.allclose(sums[np.diff(adjacency.indptr) > 0], 1)
+    assert np.all(adjacency.data >= 0)
+    return features, adjacency, owners
+
+
+def pooled_attributes(p, level, attributes):
+    """Fixed |P| support means of fine attributes and support mass.
+
+    The caller includes phi and phi squared, so their means also encode the
+    support variance. These statistics are not a coarse physical-field solve.
+    """
+    transfer, _ = local_csr(p, level.transfer)
+    transfer.data = np.abs(transfer.data)
+    mass = p.reduce(np.asarray(transfer.sum(axis=0)).ravel())
+    weighted = p.reduce(transfer.T @ attributes)
+    assert np.all(mass > 0)
+    means = weighted / mass[:, None]
+    lo, hi = map(int, level.owners[p.rank:p.rank+2])
+    return means[lo:hi].copy(), mass[lo:hi].copy()

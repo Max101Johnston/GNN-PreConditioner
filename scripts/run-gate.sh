@@ -9,7 +9,7 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$source/src"
 (
 set -e
-printf '[run] Start %s job %s stage numerical-gate node %s\n' "$(date --iso-8601=seconds)" "$SLURM_JOB_ID" "$(hostname)"
+printf '[run] Start %s job %s stage %s node %s\n' "$(date --iso-8601=seconds)" "$SLURM_JOB_ID" "$(cfg stage)" "$(hostname)"
 python3 - "$config" <<'PY'
 import hashlib,json,pathlib,sys
 cfg=json.loads(pathlib.Path(sys.argv[1]).read_text())
@@ -34,13 +34,18 @@ export SINGULARITYENV_PYTHONPATH="$PYTHONPATH:$(cfg container_pythonpath)"
 export SINGULARITYENV_PYTHONDONTWRITEBYTECODE=1
 unset PETSC_OPTIONS SINGULARITYENV_PETSC_OPTIONS
 "$(cfg torch_python)" -B -m unittest discover -s "$source/tests"
+if [[ "$(cfg stage)" == "pretrain" ]]; then
+    export LD_LIBRARY_PATH="$(cfg cuda_toolkit)/lib64:${LD_LIBRARY_PATH:-}"
+    "$(cfg torch_python)" -B -m gnn_amg.pretrain "$config"
+else
 net=$(cfg mpi_tcp_interface)
 export SINGULARITYENV_OMPI_MCA_btl_tcp_if_include="$net"
 export SINGULARITYENV_OMPI_MCA_oob_tcp_if_include="$net"
-timeout --signal=TERM --kill-after=30 3300 mpirun --tag-output --bind-to core \
+timeout --signal=TERM --kill-after=30 "$(cfg mpi_timeout_seconds)" mpirun --tag-output --bind-to core \
     --mca btl self,tcp --mca btl_tcp_if_include "$net" --mca oob_tcp_if_include "$net" \
     -np "$(cfg mpi_ranks)" singularity exec -B "$(cfg remote_root)" "$(cfg image)" \
     /opt/ogs/bin/python3 -B -m gnn_amg.gate "$config" < /dev/null
+fi
 ) 2>&1 | tee -a "$full" | python3 -B -u -m gnn_amg.logs "$task/logs/ogs_tail.log"
 codes=("${PIPESTATUS[@]}")
 batch=${codes[0]}
