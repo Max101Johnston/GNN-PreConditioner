@@ -139,7 +139,7 @@ def serve(config, endpoint):
     from .dataset import FEATURE_NAMES
     if not torch.cuda.is_available():
         raise RuntimeError("Policy service requires allocated CUDA GPU")
-    torch.set_num_threads(8)
+    torch.set_num_threads(config["gpu_cpu_threads"])
     torch.backends.cuda.matmul.allow_tf32 = False
     assert digest(config["policy_checkpoint"]) == config["policy_checkpoint_sha256"]
     saved = torch.load(config["policy_checkpoint"], map_location="cpu")
@@ -156,8 +156,14 @@ def serve(config, endpoint):
     listener.settimeout(600)
     token = secrets.token_hex(32)
     private = dict(host=socket.gethostname(), port=listener.getsockname()[1], token=token)
-    with os.fdopen(os.open(endpoint, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+    pending = Path(str(endpoint)+".pending")
+    with os.fdopen(os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
         json.dump(private, f)
+        f.flush()
+        os.fsync(f.fileno())
+    if Path(endpoint).exists():
+        raise FileExistsError(endpoint)
+    os.rename(pending, endpoint)
     record(config, "gpu_policy_server_ready", endpoint=str(endpoint), device=torch.cuda.get_device_name(),
            checkpoint_sha256=config["policy_checkpoint_sha256"], fractional_sizes=fractions.tolist())
     stream, _ = listener.accept()

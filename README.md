@@ -116,6 +116,6 @@ control checks the contribution of network ranking. This is a provisional
 decoder: acceptance requires actual full solves, and RL must retain original
 sampled masks separately from the executed repaired masks.
 
-CPU64 MPI and GPU16 CPU/one GPU use two components of one Slurm allocation.
+CPU64 MPI and a configurable CPU/one-GPU service use two components of one Slurm allocation.
 MPI stays on the single allocated CPU node; the GPU service is a separate job
 step. See [Slurm heterogeneous jobs](https://slurm.schedmd.com/heterogeneous_jobs.html).

@@ -50,7 +50,7 @@ elif [[ "$(cfg stage)" == "prediction" ]]; then
         fi
     }
     trap stop_gpu EXIT
-    srun --het-group=1 --exact --nodes=1 --ntasks=1 --cpus-per-task=16 \
+    srun --het-group=1 --exact --nodes=1 --ntasks=1 --cpus-per-task="$(cfg gpu_cpu_threads)" \
         env LD_LIBRARY_PATH="$(cfg cuda_toolkit)/lib64:${LD_LIBRARY_PATH:-}" \
         "$(cfg torch_python)" -B -m gnn_amg.inference "$config" "$endpoint" &
     gpu_pid=$!
