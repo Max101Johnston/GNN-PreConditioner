@@ -137,14 +137,19 @@ def serve(config, endpoint):
     import torch
     from .policy import TwoStagePolicy
     from .dataset import FEATURE_NAMES
-    if not torch.cuda.is_available():
-        raise RuntimeError("Policy service requires allocated CUDA GPU")
+    device = torch.device(config.get("inference_device", "cuda"))
+    use_cuda = device.type == "cuda"
+    if use_cuda and not torch.cuda.is_available():
+        raise RuntimeError("Configured CUDA policy device is unavailable")
+    if not use_cuda and config.get("launch_mode") == "single_node":
+        # MPI rank0 waits on the socket during inference, so share its first
+        # allocated core rather than requesting a second resource group.
+        os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
     torch.set_num_threads(config["gpu_cpu_threads"])
     torch.backends.cuda.matmul.allow_tf32 = False
     assert digest(config["policy_checkpoint"]) == config["policy_checkpoint_sha256"]
     saved = torch.load(config["policy_checkpoint"], map_location="cpu")
     assert saved["feature_names"] == FEATURE_NAMES
-    device = torch.device("cuda")
     model = TwoStagePolicy(len(FEATURE_NAMES), config["training"]["width"]).to(device)
     model.load_state_dict(saved["model"])
     model.eval()
@@ -164,7 +169,8 @@ def serve(config, endpoint):
     if Path(endpoint).exists():
         raise FileExistsError(endpoint)
     os.rename(pending, endpoint)
-    record(config, "gpu_policy_server_ready", endpoint=str(endpoint), device=torch.cuda.get_device_name(),
+    record(config, "policy_server_ready", endpoint=str(endpoint),
+           device=torch.cuda.get_device_name() if use_cuda else "cpu",
            checkpoint_sha256=config["policy_checkpoint_sha256"], fractional_sizes=fractions.tolist())
     stream, _ = listener.accept()
     stream.settimeout(600)
@@ -194,7 +200,8 @@ def serve(config, endpoint):
                 scores = np.zeros(n, np.float32)
             else:
                 x = np.clip((features-mean[stage])/scale[stage], -12, 12).astype(np.float32)
-                torch.cuda.synchronize()
+                if use_cuda:
+                    torch.cuda.synchronize()
                 network_start = time.perf_counter()
                 graph = torch.sparse_csr_tensor(torch.as_tensor(arrays["indptr"], dtype=torch.int64),
                     torch.as_tensor(arrays["indices"], dtype=torch.int64), torch.as_tensor(arrays["weights"]),
@@ -202,13 +209,14 @@ def serve(config, endpoint):
                 with torch.no_grad():
                     scores = model(torch.as_tensor(x, device=device), graph,
                         torch.as_tensor(prior, device=device), stage).cpu().numpy()
-                torch.cuda.synchronize()
+                if use_cuda:
+                    torch.cuda.synchronize()
                 network_seconds = time.perf_counter()-network_start
                 del graph
             selected, decoded = spatial_decode(scores, features, arrays["native"], arrays["eligible"],
                 arrays["indptr"], arrays["indices"], float(fractions[stage]))
             calls += 1
-            reply = dict(stage=stage, decoder=decoded, gpu_network_with_copies_s=network_seconds,
+            reply = dict(stage=stage, decoder=decoded, network_with_copies_s=network_seconds, device=str(device),
                 service_compute_s=time.perf_counter()-begin, neutral=request.get("neutral", False))
             send_packet(stream, reply, dict(selected=selected))
     except BaseException as error:
@@ -221,7 +229,7 @@ def serve(config, endpoint):
     finally:
         stream.close()
         listener.close()
-    record(config, "gpu_policy_server_stopped", calls=calls)
+    record(config, "policy_server_stopped", calls=calls)
 
 
 if __name__ == "__main__":

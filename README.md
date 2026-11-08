@@ -119,3 +119,10 @@ sampled masks separately from the executed repaired masks.
 CPU64 MPI and a configurable CPU/one-GPU service use two components of one Slurm allocation.
 MPI stays on the single allocated CPU node; the GPU service is a separate job
 step. See [Slurm heterogeneous jobs](https://slurm.schedmd.com/heterogeneous_jobs.html).
+
+For a single-node allocation, set `launch_mode=single_node`,
+`inference_device=cpu` and one inference thread. The existing checkpoint is
+reused; the model service shares the first allocated core while MPI rank0
+waits for its reply. All64 numerical ranks and the original RAS partitioning
+remain unchanged. This mode avoids a second scheduler allocation. Its measured
+cost is explicitly CPU inference and must not be called a GPU speedup.

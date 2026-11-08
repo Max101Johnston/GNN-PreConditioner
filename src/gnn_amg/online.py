@@ -52,7 +52,7 @@ def choose(config, p, bridge, rpc, matrix, native, comp, attributes, fixed, mass
     timing = dict(feature_s=p.maximum(local_features_end-start), gather_s=p.maximum(gather_end-local_features_end),
                   rpc_broadcast_s=p.maximum(end-gather_end), wall_s=p.maximum(end-start))
     if p.rank == 0:
-        timing["gpu_reply"] = reply
+        timing["policy_reply"] = reply
     return global_selection[lo:hi].copy(), timing
 
 
@@ -125,7 +125,7 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     result.update(method="neutral_spatial" if neutral else "gnn_spatial", failure=failure,
         setup_wall_s=setup_s, numerical=numerical, timings=timings, gnn_inference=not neutral,
         checkpoint_sha256=config["policy_checkpoint_sha256"], teacher_hierarchy_read=False,
-        timing_scope="Fresh physical/algebraic features,2decisionGPU/RPC path,repair,preconditioner construction and complete true-residual-monitored solve. Algebra audits included. Replay input loading and artifact logging excluded for all methods.")
+        timing_scope="Fresh physical/algebraic features,2decisionpolicy/RPC path,repair,preconditioner construction and complete true-residual-monitored solve. Algebra audits included. Replay input loading and artifact logging excluded for all methods.")
     # Archive raw/executed choices after the measured numerical work.
     arrays = dict(native=gather_array(p, native, layout["ownership"]).astype(np.int64),
         raw_first=gather_array(p, proposed_first, layout["ownership"]).astype(bool),
