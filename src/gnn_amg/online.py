@@ -122,7 +122,8 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     else:
         setup_s = p.maximum(time.perf_counter()-begin)
         result = dict(reached_true_target=False, total_wall_s=setup_s)
-    result.update(method="neutral_spatial" if neutral else "gnn_spatial", failure=failure,
+    decoder_name = "graph" if config.get("decoder", {}).get("kind") == "directed_graph" else "spatial"
+    result.update(method=("neutral_" if neutral else "gnn_")+decoder_name, failure=failure,
         setup_wall_s=setup_s, numerical=numerical, timings=timings, gnn_inference=not neutral,
         checkpoint_sha256=config["policy_checkpoint_sha256"], teacher_hierarchy_read=False,
         timing_scope="Fresh physical/algebraic features,2decisionpolicy/RPC path,repair,preconditioner construction and complete true-residual-monitored solve. Algebra audits included. Replay input loading and artifact logging excluded for all methods.")
@@ -202,9 +203,9 @@ def main():
                         teacher = dict(retained_entry=next(e for e in export["spaces"] if e["label"] == config["baseline_label"]))
                     result = run_method(config, p, replay, legacy, bridge, row, layout, data, method, teacher)
                 else:
-                    assert method in ("gnn_spatial", "neutral_spatial")
+                    assert method in ("gnn_spatial", "neutral_spatial", "gnn_graph", "neutral_graph")
                     result = solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
-                        neutral=method == "neutral_spatial")
+                        neutral=method.startswith("neutral_"))
                 result["key"] = key
                 results.append(result)
                 if p.rank == 0:
@@ -217,7 +218,7 @@ def main():
                         numerical=result["numerical"], timings=result.get("timings"))
             p.destroy("Vec", data[3], data[4])
             p.destroy("Mat", data[2])
-        passed = all(r["reached_true_target"] for r in results if r["method"] != "neutral_spatial")
+        passed = all(r["reached_true_target"] for r in results if not r["method"].startswith("neutral_"))
         if p.rank == 0:
             summary = dict(passed=passed, job=job, config_sha256=digest(args.config),
                 failures=[dict(key=r["key"], method=r["method"], reason=r["failure"]) for r in results if not r["reached_true_target"]],

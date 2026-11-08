@@ -133,6 +133,62 @@ def spatial_decode(scores, features, native, eligible, indptr, indices, fraction
         size_fraction=float(selected.sum()/len(valid)), score_rule="highest score per component/bin; native-ID tie break")
 
 
+
+def graph_decode(scores, native, eligible, indptr, indices, radius):
+    """One score ordering, followed by directed strong-path exclusion.
+
+    A selected DOF suppresses only rows that can reach it along at most
+    ``radius`` actual outgoing strong dependencies. No geometric distances,
+    teacher IDs, AMG coarsener, interpolation or extra network calls are used.
+    Zero-outgoing-degree F rows follow the backend's special-F convention.
+    Native IDs resolve score ties independently of MPI ownership/order.
+    The radius is frozen before RL; the number of selected DOFs is an output.
+    """
+    from scipy import sparse
+    scores = np.asarray(scores)
+    native = np.asarray(native, dtype=np.int64)
+    eligible = np.asarray(eligible, dtype=bool)
+    n = len(native)
+    if scores.shape != (n,) or eligible.shape != (n,) or not np.isfinite(scores).all():
+        raise ValueError("Invalid graph decoder arrays")
+    if not isinstance(radius, (int, np.integer)) or not 1 <= radius <= 9:
+        raise ValueError("Radius must fit the fixed nine-hop multipass limit")
+    degree = np.diff(indptr)
+    candidates = np.flatnonzero(eligible & (degree > 0))
+    # Transpose: for C=j, visit rows i with i -> j, not the reverse direction.
+    graph = sparse.csr_matrix((np.ones(len(indices), np.uint8), indices, indptr), shape=(n, n))
+    incoming = graph.transpose().tocsr()
+    order = candidates[np.lexsort((native[candidates], -scores[candidates]))]
+    distance = np.full(n, radius+1, np.int8)
+    selected = np.zeros(n, bool)
+    for root in order:
+        if distance[root] <= radius:
+            continue
+        selected[root] = True
+        distance[root] = 0
+        frontier = np.asarray([root], dtype=np.int64)
+        for depth in range(1, radius+1):
+            starts = incoming.indptr[frontier]
+            lengths = incoming.indptr[frontier+1] - starts
+            offsets = np.r_[0, np.cumsum(lengths)]
+            if offsets[-1] == 0:
+                break
+            positions = np.repeat(starts-offsets[:-1], lengths) + np.arange(offsets[-1])
+            parents = incoming.indices[positions]
+            frontier = np.unique(parents[eligible[parents] & (distance[parents] > depth)])
+            if len(frontier) == 0:
+                break
+            distance[frontier] = depth
+    if len(candidates) and (not selected.any() or np.any(distance[candidates] > radius)):
+        raise RuntimeError("Directed decoder coverage failed")
+    return selected, dict(rule="GNN score ordering with directed strong-path exclusion",
+        radius=int(radius), proposed=int(selected.sum()), eligible=int(eligible.sum()),
+        special_fine=int(np.count_nonzero(eligible & (degree == 0))),
+        maximum_path=int(distance[candidates].max()) if len(candidates) else 0,
+        size_fraction=float(selected.sum()/max(1, eligible.sum())),
+        teacher_read=False, amg_coarsener_called=False)
+
+
 def serve(config, endpoint):
     import torch
     from .policy import TwoStagePolicy
@@ -213,8 +269,12 @@ def serve(config, endpoint):
                     torch.cuda.synchronize()
                 network_seconds = time.perf_counter()-network_start
                 del graph
-            selected, decoded = spatial_decode(scores, features, arrays["native"], arrays["eligible"],
-                arrays["indptr"], arrays["indices"], float(fractions[stage]))
+            if config.get("decoder", {}).get("kind") == "directed_graph":
+                selected, decoded = graph_decode(scores, arrays["native"], arrays["eligible"],
+                    arrays["indptr"], arrays["indices"], config["decoder"]["radii"][stage])
+            else:
+                selected, decoded = spatial_decode(scores, features, arrays["native"], arrays["eligible"],
+                    arrays["indptr"], arrays["indices"], float(fractions[stage]))
             calls += 1
             reply = dict(stage=stage, decoder=decoded, network_with_copies_s=network_seconds, device=str(device),
                 service_compute_s=time.perf_counter()-begin, neutral=request.get("neutral", False))

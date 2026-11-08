@@ -126,3 +126,14 @@ reused; the model service shares the first allocated core while MPI rank0
 waits for its reply. All64 numerical ranks and the original RAS partitioning
 remain unchanged. This mode avoids a second scheduler allocation. Its measured
 cost is explicitly CPU inference and must not be called a GPU speedup.
+
+The optional `decoder.kind=directed_graph` uses the single GNN score ordering
+and excludes only rows that can reach a chosen representative through the
+actual directed strong graph within a configured radius (at most nine hops).
+The two radii are frozen before RL. Counts emerge from scores and connectivity;
+no AMG hierarchy/coarsener is used. Numerical interpolation and the separate
+bounded repair remain unchanged. This replaces the failed spatial decoder for
+independent acceptance; the original implementation stays for reproducibility.
+The `neutral_graph` control measures what this deterministic constraint alone
+achieves. Successful coverage by itself is neither convergence nor evidence
+of a learned speed improvement.

@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 from scipy import sparse
 
-from gnn_amg.inference import receive_packet, send_packet, spatial_decode
+from gnn_amg.inference import receive_packet, send_packet, spatial_decode, graph_decode
 
 
 class InferenceTests(unittest.TestCase):
@@ -24,6 +24,32 @@ class InferenceTests(unittest.TestCase):
             np.testing.assert_array_equal(actual[key], arrays[key])
         left.close()
         right.close()
+
+    def test_directed_decoder_covers_anisotropic_disconnected_graph(self):
+        # Directed chains at several scales: geometry cannot establish reachability.
+        n = 147
+        native = np.arange(n, dtype=np.int64)*3
+        rows = np.r_[np.arange(48), np.arange(49, 97), np.arange(98, 146)]
+        cols = rows+1
+        graph = sparse.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
+        eligible = np.ones(n, bool)
+        eligible[19] = False
+        scores = np.cos(native*.217)
+        selected, detail = graph_decode(scores, native, eligible, graph.indptr, graph.indices, 4)
+        self.assertFalse(selected[19])
+        self.assertFalse(np.any(selected[[48, 97, 146]]))  # special-F sinks
+        covered = selected.copy()
+        for _ in range(4):
+            covered |= eligible & (graph @ covered.astype(np.int32) > 0)
+        self.assertTrue(np.all(covered[eligible & (np.diff(graph.indptr) > 0)]))
+        self.assertEqual(detail["special_fine"], 3)
+        other, _ = graph_decode(-scores, native, eligible, graph.indptr, graph.indices, 4)
+        self.assertTrue(np.any(selected != other))
+        permutation = np.random.default_rng(17).permutation(n)
+        reordered = graph[permutation][:, permutation].tocsr()
+        actual, _ = graph_decode(scores[permutation], native[permutation], eligible[permutation],
+            reordered.indptr, reordered.indices, 4)
+        np.testing.assert_array_equal(np.sort(native[selected]), np.sort(native[permutation][actual]))
 
     def test_spatial_decoder_is_order_independent_and_score_sensitive(self):
         xyz = np.stack(np.meshgrid(np.arange(7), np.arange(5), np.arange(3), indexing='ij'), axis=-1).reshape(-1, 3)
