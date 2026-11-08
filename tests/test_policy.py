@@ -106,7 +106,10 @@ class PolicyTests(unittest.TestCase):
                 self.assertTrue(torch.equal(p, initial[name]))
         for parameter, derivative in zip(trainable, expected):
             torch.testing.assert_close(parameter.grad, derivative)
-        result = learner.commit()
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = learner.commit()
         self.assertGreater(result["parameter_delta_norm"], 0)
         self.assertEqual(result["phase"], "second")
         for name, delta in result["parameter_changes"].items():

@@ -274,7 +274,9 @@ def solve_with_deadline(p, replay, outer, matrix, rhs, solution, cap, true_limit
             p.call("VecAYPX", work, -1., rhs)
             residual = p.norm(work)
             overdue = p.maximum(float(time.perf_counter() > deadline)) > 0
-            history.append(dict(iteration=int(iteration), internal_norm=float(internal), true_residual=residual))
+            history.append(dict(iteration=int(iteration),
+                internal_norm=float(internal) if np.isfinite(internal) else None,
+                true_residual=residual if np.isfinite(residual) else None))
             reason[0] = -5 if overdue else (2 if residual <= true_limit else (-9 if not np.isfinite(residual) else (-3 if iteration >= cap else 0)))
             return 0
         except BaseException as error:

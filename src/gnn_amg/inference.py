@@ -378,6 +378,8 @@ class PolicyLearner:
         path = Path(self.config["output_directory"]) / "checkpoints" / ("rl-%s-update%06d-%s.pt" % (run, self.update, tag))
         if path.exists():
             raise FileExistsError(path)
+        if tag.startswith("validation") and self.best is not None:
+            self.best["checkpoint_path"] = str(path)
         state = {name: self.saved[name] for name in ("feature_names", "feature_mean", "feature_scale", "coarse_fraction", "dataset_job")}
         state.update(kind="reinforce", model=self.model.state_dict(), optimizer=self.optimizer.state_dict(),
             updates=self.update, reward_baseline=self.baseline.values, rng_generator=self.rng.bit_generator.state,
@@ -399,7 +401,7 @@ class PolicyLearner:
         failures = sum(not r["accurate"] for r in cases)
         cost = sum(r["seconds"] if r["accurate"] else self.settings["episode_timeout_seconds"] for r in cases)
         result = dict(update=self.update, failures=failures, cumulative_seconds=cost, cases=cases,
-            cumulative_scope="Fixed saved validation pool, not a full Newton trajectory")
+            cumulative_scope="Fixed saved "+("training-smoke" if all(r["split"] == "training" for r in cases) else "validation")+" pool, not a full Newton trajectory")
         score = (failures, cost)
         if self.best is None or score < (self.best["failures"], self.best["cumulative_seconds"]):
             self.best = result.copy()

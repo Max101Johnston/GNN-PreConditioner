@@ -245,7 +245,10 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
         reference_details[row["key"]] = dict(amg_seconds=result["total_wall_s"])
         save_result(row, "reference-amg", result)
         if row in evaluation:
-            export_path = old / "records" / ("solver-export-retained-solver-"+row["key"]+".json")
+            prefix = config.get("retained_export_prefixes", {}).get(row["split"], "retained-solver")
+            export_path = old / "records" / ("solver-export-"+prefix+"-"+row["key"]+".json")
+            if row["split"] == "validation" and not export_path.exists():
+                raise FileNotFoundError("Required retained validation comparator: "+str(export_path))
             if export_path.exists():
                 export = read_json(export_path)
                 teacher = dict(retained_entry=next(e for e in export["spaces"] if e["label"] == config["baseline_label"]))
