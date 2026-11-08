@@ -1,0 +1,38 @@
+import unittest
+
+import torch
+
+from gnn_amg.policy import TwoStagePolicy, sample_local
+from gnn_amg.objective import RewardBaseline, reinforce_loss
+
+
+class PolicyTests(unittest.TestCase):
+    def test_repair_does_not_change_saved_action(self):
+        torch.manual_seed(3)
+        logits = torch.zeros(6, requires_grad=True)
+        eligible = torch.tensor([1, 1, 1, 1, 1, 0], dtype=torch.bool)
+        mask = torch.tensor([1, 0, 1, 0, 1, 1], dtype=torch.bool)
+        frozen = torch.tensor([0, 1, 0, 1, 0, 1], dtype=torch.bool)
+        sample = sample_local(logits, frozen, mask, eligible)
+        saved = sample.raw.clone()
+        repaired = sample.raw.clone()
+        repaired[:] = True
+        self.assertTrue(torch.equal(saved, sample.raw))
+        self.assertTrue(torch.equal(sample.raw[~mask & eligible], frozen[~mask & eligible]))
+        self.assertFalse(sample.raw[-1])
+        loss = reinforce_loss([dict(key="a", samples=[sample], reward=1, importance=1)], RewardBaseline())
+        loss.backward()
+        self.assertTrue(torch.equal(logits.grad[~sample.explored], torch.zeros(3)))
+        self.assertTrue(torch.all(logits.grad[sample.explored] != 0))
+
+    def test_shared_model_accepts_actual_coarse_graph_size(self):
+        policy = TwoStagePolicy(5)
+        for stage, n in [(0, 11), (1, 3)]:
+            edges = torch.eye(n).to_sparse()
+            out = policy(torch.randn(n, 5), edges, torch.zeros(n), stage)
+            self.assertEqual(tuple(out.shape), (n,))
+            self.assertTrue(torch.isfinite(out).all())
+
+
+if __name__ == "__main__":
+    unittest.main()
