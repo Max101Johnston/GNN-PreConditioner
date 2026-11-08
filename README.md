@@ -100,3 +100,22 @@ using training examples only, and trains the shared network on one CUDA device.
 It stores an immutable checkpoint after every epoch, including optimizer and
 random-generator states. Raw-label recall is diagnostic; none of these
 checkpoints is accepted until independent predicted-C full solves pass.
+
+`gnn_amg.online` evaluates independent predicted coarse points. It reads the
+current full matrix, physical fields and DOF layout, and builds both graphs
+fresh. It never reads teacher hierarchy maps or supervised graph caches.
+`gnn_amg.inference` keeps one GPU model resident and serves the MPI root through
+a job-private authenticated numeric socket protocol. The measured candidate
+wall time includes graph extraction, MPI gathering, network transfers, both
+policy decisions, repair, numerical setup and the complete solve.
+
+The initial deterministic decoder retains the highest score per component
+in spatial bins. Bin aspect ratios use spacing observed on the current strong
+graph; the coarse size scale comes from training statistics. A neutral-score
+control checks the contribution of network ranking. This is a provisional
+decoder: acceptance requires actual full solves, and RL must retain original
+sampled masks separately from the executed repaired masks.
+
+CPU64 MPI and GPU16 CPU/one GPU use two components of one Slurm allocation.
+MPI stays on the single allocated CPU node; the GPU service is a separate job
+step. See [Slurm heterogeneous jobs](https://slurm.schedmd.com/heterogeneous_jobs.html).
