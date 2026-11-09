@@ -231,3 +231,15 @@ immutable submission receipts for recovery.
 The deployment entry point in this repository is the saved-matrix
 FieldSplit replay. A positive speed gate is the prerequisite for the
 separate continuous OGS restart comparison.
+
+### Continuous OGS comparison
+
+The opt-in `student_live` stage uses the existing OGS/PETSc SIF and the
+production consolidation-to-loading input receipt. It verifies the original
+mesh and partition hashes, reuses the original DOF numbering at the physical
+MPI rank count, and checks the live displacement split and constraint rows.
+Both variants start from the same consolidated input. The OGS Python hook
+builds the same displacement hierarchy as replay inside the live TH2M GMRES
+setup and measures the full solve with the same true-residual tolerance.
+The pilot fails on a missing hook, a numerical guard, or an incomplete final
+timestep. Runtime files and OGS results stay outside this repository.

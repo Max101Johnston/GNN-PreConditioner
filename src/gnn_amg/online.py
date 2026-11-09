@@ -6,6 +6,7 @@ named retained-base comparator reads its own cached interpolation as a baseline.
 """
 import argparse
 import ctypes as C
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -78,34 +79,53 @@ def choose(config, p, bridge, rpc, matrix, native, comp, attributes, fixed, mass
     return global_selection[lo:hi].copy(), timing
 
 
-def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
-                 neutral=False, context=None, capture=None):
-    md, rows, full, rhs, initial = data
-    solution = p.vector(full)
-    if md["configuration"]["initial_guess_nonzero"]:
-        p.call("VecCopy", initial, solution)
-    rhs_norm = p.norm(rhs)
-    p.barrier()
-    begin = time.perf_counter()
-    outer, fs, options = replay.create_solver(p, full, md, config["max_iterations"],
-        overrides={"fieldsplit_1_pc_type": "none"})
-    assert options["ksp_type"] == "gmres" and options["ksp_pc_side"] == "right"
-    assert options["pc_type"] == "fieldsplit" and options["pc_fieldsplit_type"] == "multiplicative"
-    assert float(options["ksp_rtol"]) == config["rtol"] and float(options["ksp_atol"]) == config["atol"]
-    p.call("PCSetUp", fs)
-    child, original, operator, k = replay.pcapply_child(p, fs, rows, expected_pc=b"none")
+@dataclass
+class DisplacementPC:
+    """Numerical resources shared by matrix replay and the live OGS child PC."""
+    p: object
+    fine: object
+    local: object
+    first: object
+    second: object
+    space: object
+    first_seed: object
+    second_seed: object
+    proposed_first: np.ndarray
+    proposed_second: object
+    numerical: dict
+    timings: dict
+    failure: object
+
+    def apply(self, source, target):
+        residual = self.p.array(source)
+        answer = self.local.apply(residual)
+        answer += self.space.gain(residual - self.fine(answer))
+        answer += .5 * self.local.apply(residual - self.fine(answer))
+        self.p.assign(target, answer)
+
+    def close(self):
+        seen = set()
+        for item in (self.space, self.second, self.second_seed, self.first_seed,
+                     self.first, self.local, self.fine):
+            if item is not None and id(item) not in seen:
+                item.close()
+                seen.add(id(item))
+
+
+def prepare_displacement(config, p, legacy, bridge, rpc, k, layout, fields, cache,
+                         neutral=False, context=None):
     fine = Action(p, k)
     lo, hi = map(int, layout["ownership"][p.rank:p.rank+2])
     native = (3*layout["native_node"] + layout["component"])[lo:hi].astype(np.int64)
     comp = layout["component"][lo:hi].astype(np.int32)
     fixed = fields["constrained"][native]
-    local = legacy.LocalPC(p, k, Path(config["baseline_directory"]) / "cache" / row["case"], lo, hi, "ras")
+    local = legacy.LocalPC(p, k, cache, lo, hi, "ras")
     fast = (context or {}).get("fast_prior", False)
     if fast and (neutral or context.get("policy") != "prior_only" or context.get("training")
                  or config["decoder"]["kind"] != "directed_graph"):
         raise ValueError("The fast path requires deterministic directed-graph prior selection")
     attributes = None if fast else physical_attributes(fields, layout["xyz"], native)
-    first = second = space = shell = callback = None
+    first = second = space = None
     first_seed = second_seed = None
     export_level = (context or {}).get("export_teacher_level", 0)
     models = (context or {}).get("students", {})
@@ -226,15 +246,42 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
                     numerical["k1_nnz"] = int(p.reduce([nnz.value])[0])
                 if max(numerical["galerkin_errors"]) > 1e-9:
                     failure = "galerkin_identity"
+    return DisplacementPC(p, fine, local, first, second, space, first_seed, second_seed,
+                          proposed_first, proposed_second, numerical, timings, failure)
+
+
+def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
+                 neutral=False, context=None, capture=None):
+    md, rows, full, rhs, initial = data
+    solution = p.vector(full)
+    if md["configuration"]["initial_guess_nonzero"]:
+        p.call("VecCopy", initial, solution)
+    rhs_norm = p.norm(rhs)
+    p.barrier()
+    begin = time.perf_counter()
+    outer, fs, options = replay.create_solver(p, full, md, config["max_iterations"],
+        overrides={"fieldsplit_1_pc_type": "none"})
+    assert options["ksp_type"] == "gmres" and options["ksp_pc_side"] == "right"
+    assert options["pc_type"] == "fieldsplit" and options["pc_fieldsplit_type"] == "multiplicative"
+    assert float(options["ksp_rtol"]) == config["rtol"] and float(options["ksp_atol"]) == config["atol"]
+    p.call("PCSetUp", fs)
+    child, original, operator, k = replay.pcapply_child(p, fs, rows, expected_pc=b"none")
+    cache = Path(config["baseline_directory"]) / "cache" / row["case"]
+    displacement = prepare_displacement(config, p, legacy, bridge, rpc, k, layout, fields,
+                                        cache, neutral, context)
+    first, second, space = displacement.first, displacement.second, displacement.space
+    first_seed, second_seed = displacement.first_seed, displacement.second_seed
+    proposed_first, proposed_second = displacement.proposed_first, displacement.proposed_second
+    numerical, timings, failure = displacement.numerical, displacement.timings, displacement.failure
+    lo, hi = map(int, layout["ownership"][p.rank:p.rank+2])
+    native = (3*layout["native_node"] + layout["component"])[lo:hi].astype(np.int64)
+    comp = layout["component"][lo:hi].astype(np.int32)
+    export_level = (context or {}).get("export_teacher_level", 0)
+    models = (context or {}).get("students", {})
+    shell = callback = None
     apply_times = []
     if failure is None:
-        def apply(v, z):
-            residual = p.array(v)
-            answer = local.apply(residual)
-            answer += space.gain(residual-fine(answer))
-            answer += .5*local.apply(residual-fine(answer))
-            p.assign(z, answer)
-        shell, callback = replay.pcapply_shell(p, child, operator, k, apply, apply_times)
+        shell, callback = replay.pcapply_shell(p, child, operator, k, displacement.apply, apply_times)
         replay.setup_solver(p, outer, fs, options)
         setup_s = p.maximum(time.perf_counter()-begin)
         apply_times.clear()
@@ -316,17 +363,7 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     p.destroy("KSP", outer)
     if shell is not None:
         p.destroy("PC", shell)
-    if space is not None:
-        space.close()
-    if second is not None:
-        second.close()
-    if second_seed is not None and second_seed is not second:
-        second_seed.close()
-    if first_seed is not None and first_seed is not first:
-        first_seed.close()
-    first.close()
-    local.close()
-    fine.close()
+    displacement.close()
     p.destroy("Vec", solution)
     return result
 

@@ -25,10 +25,13 @@ if [[ "${1:-}" == "--policy-rank" ]]; then
     exit 0
 fi
 config=$(realpath "${1:?analysis configuration}")
-cfg() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$config" "$1"; }
+cfg() { python3 -c 'import json,sys,functools,operator;print(functools.reduce(operator.getitem,sys.argv[2:],json.load(open(sys.argv[1]))))' "$config" "$@"; }
 task=$(cfg output_directory)
 source=$(cfg source_directory)
 full="$task/logs/$SLURM_JOB_ID.full.log"
+if [[ "$(cfg stage)" == "student_live" ]]; then
+    full="$(cfg remote_case)/logs/$SLURM_JOB_ID.full.log"
+fi
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$source/src"
 (
@@ -62,7 +65,35 @@ export SINGULARITYENV_PYTHONPATH="$PYTHONPATH:$(cfg container_pythonpath)"
 export SINGULARITYENV_PYTHONDONTWRITEBYTECODE=1
 unset PETSC_OPTIONS SINGULARITYENV_PETSC_OPTIONS
 "$(cfg torch_python)" -B -m unittest discover -s "$source/tests"
-if [[ "$(cfg stage)" == "student_train" ]]; then
+if [[ "$(cfg stage)" == "student_live" ]]; then
+    [[ "$PWD" == "$(cfg remote_case)" && "$SLURM_NTASKS" == "$(cfg live ranks)" ]]
+    image=$(cfg image)
+    root=$(cfg remote_root)
+    net=$(cfg mpi_tcp_interface)
+    work="$task/cache/live-$SLURM_JOB_ID"
+    mkdir "$work"
+    singularity exec -B "$root" "$image" /opt/ogs/bin/python3 -B -m gnn_amg.live prepare "$config" "$work"
+    binary_sha=$(singularity exec -B "$root" "$image" sha256sum /opt/ogs/bin/ogs | cut -d ' ' -f 1)
+    [[ "$binary_sha" == "$(cfg live ogs_sha256)" ]]
+    printf '[run] OGS SHA256: %s; source case: %s; project: %s\n' "$binary_sha" "$PWD" "$work/3D-SCS-1st.prj"
+    export SINGULARITYENV_OMPI_MCA_btl_tcp_if_include="$net" SINGULARITYENV_OMPI_MCA_oob_tcp_if_include="$net"
+    for method in reference student; do
+        output="$task/data/live-$SLURM_JOB_ID-$method"
+        mkdir "$output"
+        export SINGULARITYENV_GNN_LIVE_CONFIG="$config" SINGULARITYENV_GNN_LIVE_DIRECTORY="$work"
+        export SINGULARITYENV_GNN_LIVE_METHOD="$method"
+        start=$(date +%s.%N)
+        timeout --signal=TERM --kill-after=30 "$(cfg mpi_timeout_seconds)" \
+            mpirun --mca plm slurm --mca ras slurm --map-by slot --tag-output --bind-to core \
+            --mca btl self,vader,tcp --mca btl_tcp_if_include "$net" -np "$SLURM_NTASKS" \
+            singularity exec -B "$root" "$image" stdbuf -oL -eL /opt/ogs/bin/ogs \
+            -m "$PWD/input" -s "$source/src/gnn_amg" -o "$output" "$work/3D-SCS-1st.prj" < /dev/null
+        python3 -c 'import sys; print(float(sys.argv[2])-float(sys.argv[1]))' "$start" "$(date +%s.%N)" \
+            > "$work/elapsed-$method.txt"
+    done
+    unset SINGULARITYENV_GNN_LIVE_CONFIG SINGULARITYENV_GNN_LIVE_DIRECTORY SINGULARITYENV_GNN_LIVE_METHOD
+    singularity exec -B "$root" "$image" /opt/ogs/bin/python3 -B -m gnn_amg.live verify "$config" "$work"
+elif [[ "$(cfg stage)" == "student_train" ]]; then
     export LD_LIBRARY_PATH="$(cfg cuda_toolkit)/lib64:${LD_LIBRARY_PATH:-}"
     "$(cfg torch_python)" -B -m gnn_amg.train_student "$config"
 elif [[ "$(cfg stage)" == "pretrain" ]]; then
