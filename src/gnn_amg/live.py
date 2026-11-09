@@ -5,6 +5,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import time
 import traceback
 from xml.etree import ElementTree as ET
@@ -21,6 +22,39 @@ def method_names(settings):
     assert names and len(set(names)) == len(names)
     assert set(names) <= {"reference", "student", "amg"}
     return names
+
+
+def lean_times(settings):
+    times = [0.0, float(settings["end_s"])]
+    injection_start = settings.get("injection_start_s")
+    if injection_start is not None and 0 < injection_start < times[-1]:
+        times.insert(1, float(injection_start))
+    return times
+
+
+def lean_output(project, settings):
+    """Edit active output tags without reserializing the source PRJ."""
+    fields = {"pressure", "overall_molar_fraction_air", "temperature", "displacement", "phasefield"}
+    blocks = [m for m in re.finditer(r"<!--.*?-->|<output>.*?</output>", project, re.S)
+              if m.group().startswith("<output>")]
+    block, = blocks
+    parts = re.split(r"(<!--.*?-->)", block.group(), flags=re.S)
+    times = " ".join(map(str, lean_times(settings)))
+    for i in range(0, len(parts), 2):
+        text = parts[i].replace("<each_steps>1</each_steps>", "<each_steps>10000</each_steps>")
+        text = re.sub(r"(<fixed_output_times>)(\s*)[^<]*?(\s*)(</fixed_output_times>)",
+                      lambda m: m[1]+m[2]+times+m[3]+m[4], text)
+        parts[i] = re.sub(r"<variable>([^<]+)</variable>",
+            lambda m: m[0] if m[1].strip() in fields else "<!-- "+m[0]+" -->", text)
+    output = "".join(parts)
+    parsed = ET.fromstring(output)
+    assert parsed.findtext("timesteps/pair/each_steps").strip() == "10000"
+    assert [float(t) for t in parsed.findtext("fixed_output_times").split()] == lean_times(settings)
+    assert {v.text.strip() for v in parsed.findall("variables/variable")} == fields
+    project = project[:block.start()]+output+project[block.end():]
+    field_diagnostic = "<output_integration_point_fields>true</output_integration_point_fields>"
+    assert project.count(field_diagnostic) == 1
+    return project.replace(field_diagnostic, field_diagnostic.replace("true", "false"))
 
 
 def prepare(config_path, directory):
@@ -56,6 +90,10 @@ def prepare(config_path, directory):
     for before, after, count in changes:
         assert raw.count(before) == count, before
         raw = raw.replace(before, after)
+    output_profile = settings.get("output_profile", "production")
+    assert output_profile in ("production", "lean")
+    if output_profile == "lean":
+        raw = lean_output(raw, settings)
     methods = method_names(settings)
     amg_option = "-th2m_fieldsplit_1_pc_type hypre"
     assert raw.count(amg_option) == 1
@@ -103,6 +141,7 @@ def prepare(config_path, directory):
     with (directory / "input-identity.json").open("x") as f:
         json.dump(dict(project=prepared_project["path"], project_sha256=prepared_project["sha256"], projects=projects,
             input_files=len(receipt["files"]), source_loading_job=receipt["job_id"],
+            output_profile=output_profile,
             consolidated_sha256=receipt["source"]["sha256"],
             consolidated_time_s=receipt["source"]["final_frame"]["time"],
             mask_frames=len(rows), constrained=int(fixed.sum()),
@@ -308,7 +347,10 @@ def verify(config_path, directory):
         end = float(settings["end_s"])
         assert accepted and math.isclose(accepted[-1], end, abs_tol=1e-9)
         pvd, = result.glob("*.pvd")
-        final = max(ET.parse(pvd).iter("DataSet"), key=lambda e: float(e.attrib["timestep"]))
+        frames = list(ET.parse(pvd).iter("DataSet"))
+        if settings.get("output_profile") == "lean":
+            assert [float(e.attrib["timestep"]) for e in frames] == lean_times(settings)
+        final = max(frames, key=lambda e: float(e.attrib["timestep"]))
         assert math.isclose(float(final.attrib["timestep"]), end, abs_tol=1e-9)
         pvtu = pvd.parent / final.attrib["file"]
         pieces = [pvtu.parent / e.attrib["Source"] for e in ET.parse(pvtu).iter("Piece")]

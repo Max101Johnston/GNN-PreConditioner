@@ -249,3 +249,11 @@ displacement BoomerAMG on the same loading trajectory. This control retains
 the production HYPRE options and uses the same full-system GMRES tolerances,
 true-residual checks and output schedule as the learned hierarchy. PETSc
 reports the instantiated displacement PC before the first solve.
+
+For timing studies, set `live.output_profile` to `lean` for every method in
+the same comparison. It requests the five primary variables and checks that
+the output index contains only the start, the optional injection boundary,
+and the final time. The extra fracture diagnostics at integration points
+are disabled. The full linear and timestep diagnostic records are retained.
+Fixed output times also constrain OGS time stepping, so comparisons use the
+same profile for every method.
