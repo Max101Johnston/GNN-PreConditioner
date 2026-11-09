@@ -86,15 +86,47 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     numerical["level1"] = first.stats
     if first.stats["uncovered_free_rows"] or first.stats["empty_free_rows"] or first.stats["injection_error"] or first.stats["repair_budget_exhausted"]:
         failure = "first_interpolation_coverage_or_injection"
+    sweeps = (context or {}).get("p1_refinement_sweeps", 0)
+    if sweeps and failure is None:
+        from .interpolation import enrich_first
+
+        refine_start = time.perf_counter()
+        try:
+            refined = enrich_first(p, legacy, bridge, k, first, sweeps, config["p1_refinement_row_budget"])
+        except ValueError as error:
+            failure = str(error)
+        else:
+            first.close()
+            first = refined
+            numerical["level1"] = first.stats
+        numerical["p1_refinement_s"] = p.maximum(time.perf_counter()-refine_start)
     proposed_second = None
     if failure is None:
         pooled, mass = pooled_attributes(p, first, attributes, bridge)
         proposed_second, timings["second_decision"] = choose(config, p, bridge, rpc, first.coarse,
             first.native, first.components, pooled, np.zeros(len(first.native), bool), mass, 1, neutral, context)
-        second = Level(p, bridge, first.coarse, first.native, first.components, proposed_second,
-            np.zeros(len(first.native), bool), dict(config["interpolation"], max_coarse_dofs=config["terminal_max_dofs"]))
-        numerical["level2"] = second.stats
-        if second.stats["uncovered_free_rows"] or second.stats["empty_free_rows"] or second.stats["injection_error"] or second.stats["repair_budget_exhausted"]:
+        builder = (context or {}).get("p2_builder", "direct")
+        if builder == "staged":
+            from .interpolation import staged_level
+
+            second, numerical["level2"], failure = staged_level(
+                dict(config, p2_intermediate_radius=context["p2_radius"]),
+                p, bridge, first, proposed_second, broadcast_selection)
+        elif builder == "harmonic":
+            from .interpolation import harmonic_level
+
+            second, numerical["level2"], failure = harmonic_level(
+                config, p, legacy, bridge, first, proposed_second,
+                context["p2_entries"], broadcast_json)
+        elif builder == "direct":
+            second = Level(p, bridge, first.coarse, first.native, first.components, proposed_second,
+                np.zeros(len(first.native), bool), dict(config["interpolation"], max_coarse_dofs=config["terminal_max_dofs"]))
+            numerical["level2"] = second.stats
+        else:
+            raise ValueError("Unknown P2 builder: " + builder)
+        if second is None:
+            assert failure is not None
+        elif second.stats["uncovered_free_rows"] or second.stats["empty_free_rows"] or second.stats["injection_error"] or second.stats["repair_budget_exhausted"]:
             failure = "second_interpolation_coverage_or_injection"
         elif int(second.owners[-1]) > config["terminal_max_dofs"]:
             failure = "terminal_size_limit"
@@ -149,16 +181,30 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     arrays = dict(native=gather_array(p, native, layout["ownership"]).astype(np.int64),
         raw_first=gather_array(p, proposed_first, layout["ownership"]).astype(bool),
         executed_first=gather_array(p, first.executed_markers, layout["ownership"]).astype(np.int8))
-    if second is not None:
+    if proposed_second is not None:
         arrays.update(coarse_native=gather_array(p, first.native, first.owners).astype(np.int64),
-            raw_second=gather_array(p, proposed_second, first.owners).astype(bool),
-            executed_second=gather_array(p, second.executed_markers, first.owners).astype(np.int8))
+            raw_second=gather_array(p, proposed_second, first.owners).astype(bool))
+        if second is not None:
+            arrays["executed_second"] = gather_array(p, second.executed_markers, first.owners).astype(np.int8)
     if p.rank == 0:
         run = os.environ.get("GNN_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
         path = Path(config["output_directory"]) / "data" / ("prediction-%s-%s-%s%s.npz" % (run, row["key"], result["method"], "-"+context["tag"] if context else ""))
         with path.open("xb") as f:
             np.savez_compressed(f, **arrays)
         result["raw_executed_choices"] = dict(path=str(path), sha256=digest(path))
+    if result["reached_true_target"] and (context or {}).get("export_p2_sample"):
+        from .interpolation import collect_csr
+
+        _, ki, kj, kv = collect_csr(p, bridge, first.coarse)
+        _, pi, pj, pv = collect_csr(p, bridge, second.transfer)
+        if p.rank == 0:
+            name = "interpolation-%s-%s-%s.npz" % (run, row["key"], context["tag"])
+            sample = Path(config["output_directory"]) / "data" / name
+            with sample.open("xb") as stream:
+                np.savez_compressed(stream, k_indptr=ki, k_indices=kj, k_values=kv,
+                                    p_indptr=pi, p_indices=pj, p_values=pv,
+                                    native=arrays["coarse_native"], c2=arrays["raw_second"])
+            result["interpolation_sample"] = dict(path=str(sample), sha256=digest(sample))
     p.destroy("KSP", outer)
     if shell is not None:
         p.destroy("PC", shell)
@@ -432,9 +478,13 @@ def review(config, p, replay, legacy, bridge, rpc, inventory):
     from .gate import load_teacher, run_method
 
     workers = config["parallel_workers"]
-    keys = config["gate_keys"]
-    assert len(keys) == workers
-    rows = {row["key"]: row for row in inventory["snapshots"] if row["split"] == "training"}
+    validation = config.get("interpolation_validation", False)
+    keys = config["training"]["validation_keys"] if validation else config["gate_keys"]
+    if not validation:
+        assert len(keys) == workers
+    split = "validation" if validation else "training"
+    rows = {row["key"]: row for row in inventory["snapshots"] if row["split"] == split}
+    assert len(keys) == len(set(keys)) and all(key in rows for key in keys)
     output = Path(config["output_directory"])
     old = Path(config["baseline_directory"])
     job = os.environ["GNN_RUN_ID"]
@@ -442,7 +492,8 @@ def review(config, p, replay, legacy, bridge, rpc, inventory):
     def save(result, row, label):
         result.update(key=row["key"], label=label, worker=p.worker, solver_ranks=p.size)
         if p.rank == 0:
-            path = output / "records" / ("review-%s-w%d-%s.json" % (job, p.worker, label))
+            suffix = row["key"]+"-"+label if validation else label
+            path = output / "records" / ("review-%s-w%d-%s.json" % (job, p.worker, suffix))
             with path.open("x") as stream:
                 json.dump(result, stream, allow_nan=False, indent=2)
             record(config, "review_solve", key=row["key"], method=label,
@@ -455,14 +506,50 @@ def review(config, p, replay, legacy, bridge, rpc, inventory):
         p.destroy("Vec", data[3], data[4])
         p.destroy("Mat", data[2])
 
-    # One identical graph, score vector and frame per group. Deliberately keep
-    # the expensive Python equality check out of timed method comparisons.
-    probe = rows[keys[0]]
-    layout, fields, data = load_observed_state(config, p, replay, probe)
-    parity = solve_policy(config, p, replay, legacy, bridge, rpc, probe, layout, fields, data,
-        context=dict(policy="pretrained", check_decoder=True, tag="parity-w%d" % p.worker))
-    save(parity, probe, "decoder_parity")
-    destroy(data)
+    if validation:
+        results = []
+        for index, key in enumerate(keys):
+            if index % workers != p.worker:
+                continue
+            row = rows[key]
+            layout, fields, data = load_observed_state(config, p, replay, row)
+            # The frozen parameters come from training-only comparisons.
+            # Alternate order within a frame to reduce timing-order effects.
+            paired = [("prior_only", 0), ("prior_p1_twice", 2)]
+            if index % 2:
+                paired.reverse()
+            for label, sweeps in paired:
+                result = solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
+                    context=dict(policy="prior_only", tag=label, p1_refinement_sweeps=sweeps))
+                results.append(save(result, row, label))
+            prefix = config["retained_export_prefixes"]["validation"]
+            export = read_json(old / "records" / ("solver-export-"+prefix+"-"+key+".json"))
+            teacher = dict(retained_entry=next(e for e in export["spaces"] if e["label"] == config["baseline_label"]))
+            for label in ("retained_base", "amg"):
+                result = run_method(config, p, replay, legacy, bridge, row, layout, data, label, teacher)
+                results.append(save(result, row, label))
+            destroy(data)
+        if p.rank == 0:
+            rpc.close()
+        pieces = global_objects(p, dict(worker=p.worker, results=results))
+        if p.global_rank == 0:
+            path = output / "records" / ("review-%s.json" % job)
+            with path.open("x") as stream:
+                json.dump(dict(job=job, split=split, workers=pieces), stream, allow_nan=False, indent=2)
+        controls = [r for item in pieces for r in item["results"]
+                    if r["label"] in ("prior_only", "retained_base", "amg")]
+        return 0 if len(controls) == 3*len(keys) and all(r["reached_true_target"] for r in controls) else 2
+
+    parity = None
+    if not config.get("interpolation_review"):
+        # One identical graph, score vector and frame per group. Deliberately keep
+        # the expensive Python equality check out of timed method comparisons.
+        probe = rows[keys[0]]
+        layout, fields, data = load_observed_state(config, p, replay, probe)
+        parity = solve_policy(config, p, replay, legacy, bridge, rpc, probe, layout, fields, data,
+            context=dict(policy="pretrained", check_decoder=True, tag="parity-w%d" % p.worker))
+        save(parity, probe, "decoder_parity")
+        destroy(data)
 
     row = rows[keys[(p.worker + config.get("review_frame_offset", 0)) % workers]]
     layout, fields, data = load_observed_state(config, p, replay, row)
@@ -471,28 +558,30 @@ def review(config, p, replay, legacy, bridge, rpc, inventory):
     with np.load(old / "cache" / row["key"] / (entry["shard_pattern"] % p.rank)) as shard:
         teacher["baseline_empty"] = np.diff(shard["T0_indptr"]) == 0
 
-    # Use the previously accepted executed endpoints at both levels so that a
-    # changed strength topology at K1 cannot silently change the comparison.
-    fixed_job = config["teacher_endpoints_job"]
-    suffix = "%s-%s-r%03d.npz" % (fixed_job, row["key"], p.rank)
-    lo, hi = layout["ownership"][p.rank:p.rank+2]
-    with np.load(output / "data" / ("repair-" + suffix)) as first:
-        np.testing.assert_array_equal(first["native"], teacher["native"][lo:hi])
-        np.testing.assert_array_equal(first["raw_selected"], teacher["depth"][lo:hi] >= 3)
-        teacher["first_mask"] = first["executed_markers"] == 1
-    with np.load(output / "data" / ("repair-second-" + suffix)) as second:
-        np.testing.assert_array_equal(second["native"], teacher["native"][lo:hi][teacher["first_mask"]])
-        np.testing.assert_array_equal(second["raw_selected"], np.isin(second["native"], teacher["terminal_native"]))
-        local_terminal = second["native"][second["executed_markers"] == 1].tolist()
-    terminal = global_teacher_ids(p, local_terminal)
-    teacher["terminal_native"] = np.asarray(terminal, dtype=np.int64)
-    assert len(terminal) <= config["terminal_max_dofs"]
+    if not config.get("interpolation_review"):
+        # Use the previously accepted executed endpoints at both levels so that a
+        # changed strength topology at K1 cannot silently change the comparison.
+        fixed_job = config["teacher_endpoints_job"]
+        suffix = "%s-%s-r%03d.npz" % (fixed_job, row["key"], p.rank)
+        lo, hi = layout["ownership"][p.rank:p.rank+2]
+        with np.load(output / "data" / ("repair-" + suffix)) as first:
+            np.testing.assert_array_equal(first["native"], teacher["native"][lo:hi])
+            np.testing.assert_array_equal(first["raw_selected"], teacher["depth"][lo:hi] >= 3)
+            teacher["first_mask"] = first["executed_markers"] == 1
+        with np.load(output / "data" / ("repair-second-" + suffix)) as second:
+            np.testing.assert_array_equal(second["native"], teacher["native"][lo:hi][teacher["first_mask"]])
+            np.testing.assert_array_equal(second["raw_selected"], np.isin(second["native"], teacher["terminal_native"]))
+            local_terminal = second["native"][second["executed_markers"] == 1].tolist()
+        terminal = global_teacher_ids(p, local_terminal)
+        teacher["terminal_native"] = np.asarray(terminal, dtype=np.int64)
+        assert len(terminal) <= config["terminal_max_dofs"]
 
     methods = list(config["review_methods"])
     rotate = (p.worker * 3) % len(methods)
     results = []
     for name in methods[rotate:] + methods[:rotate]:
-        if name in ("amg", "retained_base", "teacher_cached_first", "teacher_cached_first_repaired"):
+        if name in ("amg", "retained_base", "teacher_cached_first", "teacher_cached_first_repaired",
+                    "teacher_cross", "teacher_cached_coverage"):
             result = run_method(config, p, replay, legacy, bridge, row, layout, data, name, teacher)
         elif name in config["teacher_variants"]:
             setting = dict(config["interpolation"], coverage_repair_fraction=0.0)
@@ -502,8 +591,19 @@ def review(config, p, replay, legacy, bridge, rpc, inventory):
             result["interpolation"] = setting
             result["fixed_endpoints_job"] = fixed_job
         else:
+            context = dict(policy=name, tag=name,
+                           export_p2_sample=name in config.get("export_p2_samples", []))
+            if name in config.get("p2_staged_variants", {}):
+                context.update(policy="prior_only", p2_builder="staged",
+                               p2_radius=config["p2_staged_variants"][name])
+            if name in config.get("p2_harmonic_variants", {}):
+                context.update(policy="prior_only", p2_builder="harmonic",
+                               p2_entries=config["p2_harmonic_variants"][name])
+            if name in config.get("p1_refinement_variants", {}):
+                context.update(policy="prior_only",
+                               p1_refinement_sweeps=config["p1_refinement_variants"][name])
             result = solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
-                                  context=dict(policy=name, tag=name))
+                                  context=context)
         results.append(save(result, row, name))
     destroy(data)
     if p.rank == 0:
@@ -516,9 +616,10 @@ def review(config, p, replay, legacy, bridge, rpc, inventory):
             json.dump(dict(job=job, workers=pieces), stream, allow_nan=False, indent=2)
     # Policy or weight variants can fail numerically. Preserve and report those
     # outcomes without losing the diagnostic job and its successful controls.
-    controls = [r for item in pieces for r in item["results"]
-                if r["label"] in ("amg", "retained_base", "teacher_current")]
-    return 0 if len(controls) == 3*workers and all(r["reached_true_target"] for r in controls) else 2
+    labels = ("retained_base", "prior_only") if config.get("interpolation_review") else (
+        "amg", "retained_base", "teacher_current")
+    controls = [r for item in pieces for r in item["results"] if r["label"] in labels]
+    return 0 if len(controls) == len(labels)*workers and all(r["reached_true_target"] for r in controls) else 2
 
 
 def global_teacher_ids(p, local_ids):

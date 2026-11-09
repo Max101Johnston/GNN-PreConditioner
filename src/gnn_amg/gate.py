@@ -108,6 +108,10 @@ class RetainedFirst:
         assert digest(path) == entry["shards"][p.rank]
         with np.load(path) as archive:
             fine_owners, self.owners = archive["ownership0"], archive["ownership1"]
+            self.terminal_owners = archive["ownership2"]
+            self.cached_second = csr_matrix(
+                (archive["T1_data"], archive["T1_indices"], archive["T1_indptr"]),
+                shape=archive["T1_shape"])
             transfer, coarse = (
                 csr_matrix((archive[name+"_data"], archive[name+"_indices"], archive[name+"_indptr"]),
                            shape=archive[name+"_shape"])
@@ -126,12 +130,14 @@ class RetainedFirst:
         assert np.all(np.isfinite(injection) & (injection != 0))
         # Cached coarse columns have their own balanced ownership. An injection
         # row can identify a column owned by another rank.
-        mapping = np.zeros((2, self.owners[-1]), dtype=np.float64)
+        mapping = np.zeros((3, self.owners[-1]), dtype=np.float64)
         mapping[0, columns] = teacher["native"][lo:hi][rows]
         np.add.at(mapping[1], columns, 1)
+        mapping[2, columns] = injection
         mapping = p.reduce(mapping)
         assert np.all(mapping[1] == 1), "L3 injection is not a bijection"
         self.native = mapping[0, start:stop].astype(np.int64)
+        self.column_scale = mapping[2]
         self.components = (self.native % 3).astype(np.int32)
         self.transfer_action = legacy.DistributedSparse(p, transfer, fine_owners, self.owners)
         self.coarse_action = legacy.DistributedSparse(p, coarse, self.owners, self.owners)
@@ -143,6 +149,46 @@ class RetainedFirst:
     def close(self):
         self.coarse_action.close()
         self.transfer_action.close()
+
+
+def fixed_first_cross(config, p, legacy, bridge, k, cached, teacher, lo, hi):
+    from scipy.sparse import csr_matrix
+    from .backend import local_csr
+    from .interpolation import imported_transfer
+
+    native = teacher["native"][lo:hi]
+    selected = teacher["depth"][lo:hi] >= 3
+    settings = dict(config["interpolation"], coverage_repair_fraction=0.0)
+    direct = Level(p, bridge, k, native, (native % 3).astype(np.int32), selected,
+                   teacher["fixed"][lo:hi], settings)
+    try:
+        retained_ids = p.all_rows(cached.native, cached.owners).astype(np.int64)
+        direct_ids = p.all_rows(direct.native, direct.owners).astype(np.int64)
+        order = np.argsort(retained_ids)
+        column_map = order[np.searchsorted(retained_ids[order], direct_ids)]
+        np.testing.assert_array_equal(retained_ids[column_map], direct_ids)
+        assert len(direct_ids) == len(retained_ids) and direct.stats["injection_error"] == 0
+        csr, owners = local_csr(p, direct.transfer, bridge)
+        cols = column_map[csr.indices]
+        # The cached P2 acts in the cached P1 column coordinates, including
+        # their energy scale. Permutation alone would change the experiment.
+        replacement = csr_matrix((csr.data*cached.column_scale[cols], cols, csr.indptr),
+                                 shape=csr.shape)
+        replacement.eliminate_zeros()
+        original = cached.transfer_action.cpu
+        fill = (np.diff(replacement.indptr) == 0) & (np.diff(original.indptr) > 0)
+        assert not np.any(fill & selected)
+        replacement = (replacement + original.multiply(fill[:, None])).tocsr()
+        replacement.sort_indices()
+        nnz, fill_count, missing = map(int, p.reduce([replacement.nnz, fill.sum(),
+            np.count_nonzero((np.diff(replacement.indptr) == 0) & (np.diff(original.indptr) > 0))]))
+        assert missing == 0 and np.isfinite(replacement.data).all()
+        stats = dict(source="fixed_direct_P1_with_cached_empty_row_completion",
+                     coarse_dofs=len(retained_ids), nnz=nnz, cached_rows=fill_count,
+                     original_direct=direct.stats, coarse_ids_preserved=True)
+        return imported_transfer(p, legacy, k, replacement, owners, cached.owners, stats)
+    finally:
+        direct.close()
 
 
 def checked_hierarchy(config, p, legacy, first, second):
@@ -177,7 +223,7 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
     child, original, operator, k = replay.pcapply_child(p, fs, rows,
         expected_pc=b"hypre" if method == "amg" else b"none")
     fine = Action(p, k)
-    local = space = first = second = None
+    local = space = first = second = cached = None
     shell = callback = None
     stats = {}
     apply_times = []
@@ -193,7 +239,22 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
                                    nnz=int(p.reduce([space.t0.cpu.nnz])[0]))
             stats["level2"] = dict(coarse_dofs=space.structure["level_dofs"][2],
                                    nnz=int(p.reduce([space.t1.cpu.nnz])[0]))
-        elif method in ("teacher_cached_first", "teacher_cached_first_repaired"):
+        elif method == "teacher_cross":
+            from .interpolation import imported_transfer
+
+            cached = RetainedFirst(config, p, legacy, row, teacher)
+            first = fixed_first_cross(config, p, legacy, bridge, k, cached, teacher, lo, hi)
+            stats["level1"] = first.stats
+            cached_p2 = cached.cached_second
+            second_stats = dict(source="retained_P2", coarse_dofs=int(cached.terminal_owners[-1]),
+                                nnz=int(p.reduce([cached_p2.nnz])[0]),
+                                uncovered_free_rows=0, empty_free_rows=0, injection_error=0,
+                                repair_budget_exhausted=0)
+            second = imported_transfer(p, legacy, first.coarse, cached_p2,
+                                       cached.owners, cached.terminal_owners, second_stats)
+            stats["level2"] = second.stats
+            space, failure = checked_hierarchy(config, p, legacy, first, second)
+        elif method in ("teacher_cached_first", "teacher_cached_first_repaired", "teacher_cached_coverage"):
             first = RetainedFirst(config, p, legacy, row, teacher)
             stats["level1"] = first.stats
             terminal = teacher["native"][teacher["depth"] >= 5]
@@ -203,6 +264,13 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
                 dict(config["interpolation"], max_coarse_dofs=config["terminal_max_dofs"],
                      coverage_repair_fraction=fraction))
             stats["level2"] = second.stats
+            if method == "teacher_cached_coverage":
+                from .interpolation import coverage_audit
+                from .online import broadcast_json
+
+                stats["reachability"] = coverage_audit(config, p, bridge, first,
+                    np.isin(first.native, terminal), first.cached_second, broadcast_json)
+                assert stats["reachability"]["uncovered_9"] == second.stats["raw_uncovered_9_hops"]
             space, failure = checked_hierarchy(config, p, legacy, first, second)
         else:
             native = teacher["native"][lo:hi]
@@ -303,6 +371,8 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
         second.close()
     if first:
         first.close()
+    if cached:
+        cached.close()
     if local:
         local.close()
     fine.close()
