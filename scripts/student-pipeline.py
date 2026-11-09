@@ -102,7 +102,7 @@ class Pipeline:
         write_state(self.path, self.state)
 
     def update_run(self, phase, job):
-        if self.plan["mode"] in ("direct", "direct_refine"):
+        if self.plan["mode"] in ("direct", "direct_refine", "direct_context"):
             return  # The pilot keeps its own state and frozen configurations.
         path = Path(self.plan["run_record"])
         current = read(path)
@@ -237,6 +237,8 @@ class Pipeline:
             return self.run_direct()
         if self.plan["mode"] == "direct_refine":
             return self.run_direct_refinement()
+        if self.plan["mode"] == "direct_context":
+            return self.run_direct_context()
         reference = dict(name="reference")
         smoke = self.plan["mode"] == "smoke"
         if smoke:
@@ -344,6 +346,69 @@ class Pipeline:
         self.state["status"] = "direct_refinement_measured"
         self.save()
         print("DIRECT_P1_REFINEMENT_MEASURED", self.study, flush=True)
+
+    def run_direct_context(self):
+        keys = self.base["gate_keys"]
+        oracle = read(self.plan["e_oracle"])
+        e_case = oracle["oracle"]
+        assert oracle["status"] == "e_oracle_measured" and set(e_case["keys"]) == set(keys)
+        e_limit = e_case["totals"]["e_teacher_candidates"]
+        self.state["e_oracle"] = dict(job=e_case["job"], report=oracle["report"],
+            cases=e_case["cases"], totals=e_case["totals"])
+        self.save()
+        current = self.base["direct_student_control"]
+        previous = dict(name="direct_e",direct=True,students={"p1":self.base["direct_feedback_model"]})
+        candidate_steps = self.base["context_path_steps"]
+        if candidate_steps:
+            check = dict(previous,name="f_teacher_candidates",teacher_control="context_candidates")
+            diagnostic, _ = self.stage("graph", dict(student_cycle="diagnose",student_keys=keys,
+                student_evaluation_split="training",student_methods=[check],student_repeats=1))
+            result = diagnostic["totals"][check["name"]]
+            if result["failed"] or result["iterations"] >= e_limit["iterations"]:
+                candidate_steps = 0
+            self.state["graph_check"] = dict(cases=diagnostic["cases"],totals=diagnostic["totals"])
+        graph = dict(context_path_steps=candidate_steps)
+        self.state["context_path_steps"] = candidate_steps
+        self.save()
+        report, data = self.stage("data", dict(**graph,student_cycle="direct_data",student_keys=keys,
+                                               direct_teacher_kind="F"))
+        receipts = report["samples"]["1"]
+        assert report["accepted"] and {r["key"] for r in receipts} == set(keys)
+        epochs = self.plan["epochs"]
+        trained, _ = self.stage("train",dict(**graph,student_datasets=[data],student_full_training=False,
+            student_runs=[dict(level=1,kind="F",seed=20261109,width=16,epochs=epochs,
+                batch_rows=2048,learning_rate=.002,checkpoints=[3*epochs//4,epochs])]),training=True)
+        candidates = [dict(name="direct_f%02d"%model["epoch"],direct=True,students={"p1":model})
+                      for model in trained["runs"][0]["checkpoints"]]
+        screen, _ = self.stage("screen",dict(**graph,student_cycle="evaluate",student_keys=keys,
+            student_evaluation_split="training",student_methods=[current]+candidates,student_repeats=1,
+            student_reference="student"))
+        winner = self.best(screen,candidates)
+        methods = [dict(name="retained_base"),dict(name="teacher_roundtrip"),current,previous,
+                   dict(winner,name="direct_f")]
+        paired, _ = self.stage("paired",dict(**graph,student_cycle="evaluate",student_keys=keys,
+            student_evaluation_split="training",student_methods=methods,student_repeats=2,
+            student_reference="student"))
+        totals = paired["totals"]
+        assert set(totals) == {m["name"] for m in methods}
+        assert all(v["frames"]==2*len(keys) for v in totals.values())
+        assert totals["teacher_roundtrip"]["failed"]==totals["retained_base"]["failed"]==0
+        repeat_totals = [{method:sum(r["total_s"] for r in paired["cases"]
+                          if r["method"]==method and r["repeat"]==repeat) for method in totals}
+                         for repeat in range(2)]
+        reached = totals["direct_f"]["failed"]==0
+        f_iterations = {(r["key"],r["repeat"]):r["iterations"] for r in paired["cases"] if r["method"]=="direct_f"}
+        comparable = reached and totals["direct_f"]["iterations"]<=1.05*totals["student"]["iterations"] and all(
+            f_iterations[r["key"],r["repeat"]]<=1.20*r["iterations"]
+            for r in paired["cases"] if r["method"]=="student")
+        self.state["final"] = dict(scope="teacher endpoints on training frames",model=winner["students"]["p1"],
+            screening=screen["totals"],coverage={r["key"]:r["coverage"] for r in receipts},
+            cases=paired["cases"],totals=totals,repeat_totals=repeat_totals,
+            numerical_quality_gate=comparable,target_speed_gate=reached and all(
+                r["direct_f"]<=.90*r["student"] for r in repeat_totals))
+        self.state["status"] = "direct_context_measured"
+        self.save()
+        print("DIRECT_P1_CONTEXT_MEASURED",self.study,flush=True)
 
     def finish_full(self, reference, dev, p1, p2):
         valid = self.base["training"]["validation_keys"]

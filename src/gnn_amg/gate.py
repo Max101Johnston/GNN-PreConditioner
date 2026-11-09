@@ -428,7 +428,7 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
     export_direct = method == "teacher_roundtrip" and teacher.get("export_direct", False)
     if export_direct and not failure:
         space.direction_samples = []
-        if config.get("direct_teacher_kind") == "E":
+        if config.get("direct_teacher_kind") in ("E", "F"):
             space.direction_sample_calls = tuple(config["direct_sample_calls"])
     if failure:
         result = dict(reached_true_target=False, failure=failure)

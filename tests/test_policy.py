@@ -7,6 +7,23 @@ from gnn_amg.objective import RewardBaseline, reinforce_loss
 
 
 class PolicyTests(unittest.TestCase):
+    def test_context_action_backpropagates_through_hard_support_and_budget(self):
+        from gnn_amg.train_student import context_support
+
+        scores = torch.linspace(-.7,.8,14).reshape(1,14).requires_grad_()
+        budget = torch.tensor([[0.,.3,0.,0.]],requires_grad=True)
+        valid = torch.ones_like(scores,dtype=torch.bool)
+        valid[0,-1] = False
+        hard = context_support(scores,budget,valid)
+        surrogate = context_support(scores,budget,valid,.2)
+        torch.testing.assert_close(surrogate,hard.to(scores.dtype),atol=0,rtol=0)
+        self.assertEqual(hard.sum().item(),8)
+        action = (surrogate*torch.linspace(.1,1.5,14)).sum()
+        action.backward()
+        self.assertGreater(scores.grad[valid].abs().sum().item(),0)
+        self.assertEqual(scores.grad[~valid].item(),0)
+        self.assertGreater(budget.grad.abs().sum().item(),0)
+
     def test_repair_does_not_change_saved_action(self):
         torch.manual_seed(3)
         logits = torch.zeros(6, requires_grad=True)

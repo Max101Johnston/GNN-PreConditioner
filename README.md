@@ -269,6 +269,23 @@ dense output to the same hard support rule used in native inference. The
 and score cutoff. The final paired replay compares the selected E checkpoint
 with D, the frozen online student, the rebuilt teacher and the cached teacher.
 
+The `direct_context` plan starts from a completed two-arm E teacher-support
+comparison, supplied as `e_oracle`. It can extend the algebraic candidate
+frontier over bounded strong stiffness paths, using the same candidate width.
+One controlled teacher replay selects the topology by convergence. F applies
+a shared signed and unsigned graph message layer, pools fine attributes at
+coarse endpoints and summarizes the other candidates on each row. Solver
+ranks fetch only referenced fine halo rows and exchange coarse summaries.
+The deployment uses a learned row budget from 6, 8, 10 or 12 entries.
+
+F samples keep the actual fine and coarse one-hop neighborhoods. Training
+rotates batches through MPI regions, first fitting signed coefficients on
+teacher supports, then training on the executed hard support. Row ranking
+supervision and a soft backward gate let the action loss update edge and
+budget scores. The exported model is evaluated with the same hard decoder
+in distributed replay. The plan reports numerical quality and total-time
+gates separately before extending training to model-selected coarse points.
+
 ### Continuous OGS comparison
 
 The opt-in `student_live` stage uses the existing OGS/PETSc SIF and the

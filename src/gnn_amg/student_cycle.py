@@ -186,19 +186,23 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
         keys = config["student_keys"]
         assert len(set(keys)) == len(keys) and set(keys) <= set(train)
         feedback_cases = []
-        if config.get("direct_teacher_kind") == "E":
+        kind = config.get("direct_teacher_kind")
+        if kind in ("E", "F"):
+            source = config["direct_feedback_model"] if kind == "F" else config["direct_prior_model"]
             prior = dict(name="direct_feedback", direct=True, capture_apply=True,
-                         students={"p1":config["direct_prior_model"]})
+                         students={"p1":source})
             feedback_cases = evaluate(keys, [prior], "direct_feedback")
             assert all(row["passed"] for row in feedback_cases)
-        results = evaluate(keys, [dict(name="retained_base"),
-                                  dict(name="teacher_roundtrip", export_direct=True)], mode)
+        controls = [dict(name="teacher_roundtrip", export_direct=True)]
+        if kind != "F":
+            controls.insert(0,dict(name="retained_base"))
+        results = evaluate(keys, controls, mode)
         cases = {(r["key"], r["method"]): r for r in results}
         roundtrip = [cases[(key, "teacher_roundtrip")] for key in keys]
-        accepted = all(r["passed"] and r["teacher"] and
-                       cases[(r["key"], "retained_base")]["passed"] and
-                       r["iterations"] == cases[(r["key"], "retained_base")]["iterations"]
-                       for r in roundtrip)
+        accepted = all(r["passed"] and r["teacher"] for r in roundtrip)
+        if kind != "F":
+            accepted &= all(cases[(r["key"],"retained_base")]["passed"] and
+                r["iterations"]==cases[(r["key"],"retained_base")]["iterations"] for r in roundtrip)
         report.update(keys=keys, cases=results, totals=method_totals(results), accepted=accepted,
                       feedback_cases=feedback_cases,
                       samples={"1": [r["teacher"] for r in roundtrip if r["teacher"]]})

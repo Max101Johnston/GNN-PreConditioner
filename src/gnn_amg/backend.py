@@ -61,6 +61,53 @@ def ownership(p, matrix, columns=False):
     return np.r_[ranges[:, 0], ranges[-1, 1]]
 
 
+def neighbour_blocks(p, owners, values, indices):
+    """Fetch only the remote feature rows referenced by the owned graph."""
+    start, end = owners[p.rank:p.rank+2]
+    width = values.shape[1]
+    assert len(values) == end-start
+    valid = indices >= 0
+    owned = valid & (indices >= start) & (indices < end)
+    remote = valid & ~owned
+    requested, inverse = np.unique(indices[remote], return_inverse=True)
+    result = np.zeros(indices.shape+(width,), dtype=values.dtype)
+    result[owned] = values[indices[owned]-start]
+    if not p.maximum(len(requested)):
+        return result
+    P, I = p.P, p.I
+    ref = C.POINTER(P)
+    for name, args in {
+        "VecCreateMPIWithArray": [P, I, I, I, P, ref],
+        "VecCreateSeq": [P, I, ref],
+        "ISCreateBlock": [P, I, I, P, I, ref],
+        "VecScatterCreate": [P, P, P, P, ref],
+        "VecScatterBegin": [P, P, P, I, I],
+        "VecScatterEnd": [P, P, P, I, I],
+        "VecScatterDestroy": [ref],
+        "ISDestroy": [ref],
+    }.items():
+        bind(p, name, args)
+    self_comm = P(C.addressof((C.c_char*1).in_dll(p.mpi, "ompi_mpi_comm_self")))
+    incoming, local, index, scatter = P(), P(), P(), P()
+    features = np.ascontiguousarray(values, dtype=np.float64)
+    requested = np.ascontiguousarray(requested, dtype=np.int32)
+    try:
+        p.call("VecCreateMPIWithArray", p.world, width, features.size, int(owners[-1])*width,
+               features.ctypes.data, C.byref(incoming))
+        p.call("VecCreateSeq", self_comm, len(requested)*width, C.byref(local))
+        p.call("ISCreateBlock", self_comm, width, len(requested), requested.ctypes.data, 0, C.byref(index))
+        p.call("VecScatterCreate", incoming, index, local, None, C.byref(scatter))
+        p.call("VecScatterBegin", scatter, incoming, local, 1, 0)
+        p.call("VecScatterEnd", scatter, incoming, local, 1, 0)
+        if len(requested):
+            result[remote] = p.array(local).reshape((-1,width))[inverse]
+    finally:
+        p.destroy("VecScatter", scatter)
+        p.destroy("IS", index)
+        p.destroy("Vec", local, incoming)
+    return result
+
+
 class Action:
     """Rectangular PETSc actions, including ranks owning no coarse columns."""
     def __init__(self, p, matrix):

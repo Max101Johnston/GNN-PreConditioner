@@ -8,16 +8,20 @@ import time
 import numpy as np
 from scipy import sparse
 
-from .backend import bind, digest, local_csr, ownership
+from .backend import bind, digest, local_csr, neighbour_blocks, ownership
 from .dataset import gather_array
 from .interpolation import collect_csr, imported_transfer
 
 ROW_FEATURES = 10
 EDGE_FEATURES = 7
 LOCAL_EDGE_FEATURES = 18
+CONTEXT_EDGE_FEATURES = 22
+CONTEXT_NODE_FEATURES = 13
+CONTEXT_BUDGETS = (6, 8, 10, 12)
+CONTEXT_SCORE_SCALE = 4096
 SCHEMA = 1
 DEFAULT_CONTROL = (0.0, 0.0, 1.0, 1.0)
-STUDENT_KINDS = {"A": 0, "B": 1, "D": 2, "E": 3}
+STUDENT_KINDS = {"A": 0, "B": 1, "D": 2, "E": 3, "F": 4}
 
 
 @lru_cache(maxsize=4)
@@ -205,7 +209,35 @@ def geometry_candidates(fine_xyz, coarse_xyz, fine_comp, coarse_comp, free, coun
     return result, spacing[fine_comp]
 
 
-def local_direct_inputs(config, p, legacy, bridge, matrix, pair, components, geometry):
+def extended_reach(config, p, legacy, bridge, pair, neighbors, strengths, reach, x):
+    """Keep a small label frontier while extending actual stiffness paths."""
+    hops = config["context_path_steps"]
+    if not hops:
+        return reach
+    rows, cols = pair.fine_owners, pair.owners
+    graph = row_csr(neighbors, np.abs(strengths), (neighbors >= 0) & (strengths != 0), rows[-1])
+    left = legacy.DistributedSparse(p, graph, rows, rows)
+    empty = sparse.csr_matrix(reach.shape)
+    settings = dict(student_candidates=16, student_library=config["student_library"])
+    base = reach
+    try:
+        for _ in range(hops):
+            front = pack(settings, pair.markers, np.ones(len(x)), reach, empty, empty, x)
+            ids = front["cols"]
+            weights = front["hints"][:,:,0].astype(np.float64)
+            state = row_csr(ids, weights, (ids >= 0) & (weights != 0), cols[-1])
+            right = legacy.DistributedSparse(p, state, rows, cols)
+            try:
+                reach = base+product_rows(p, bridge, left.matrix, right.matrix)
+                reach.sort_indices()
+            finally:
+                right.close()
+    finally:
+        left.close()
+    return reach
+
+
+def local_direct_inputs(config, p, legacy, bridge, matrix, pair, components, geometry, context=False):
     """Combine geometric candidates with direct and two-hop stiffness contacts."""
     start = time.perf_counter()
     setting = config["direct_local"]
@@ -229,7 +261,7 @@ def local_direct_inputs(config, p, legacy, bridge, matrix, pair, components, geo
     anchors = np.zeros(cols[-1], dtype=np.float64)
     anchors[pair.injection_columns] = lo+pair.injection_rows
     anchors = p.reduce(anchors).astype(np.int64)
-    sums, x, _, _ = stiffness_features(p, bridge, matrix, all_comp, n, 0)
+    sums, x, neighbors, strengths = stiffness_features(p, bridge, matrix, all_comp, n, 8 if context else 0)
     stiffness, _ = local_csr(p, matrix, bridge)
     local_rows = np.repeat(np.arange(n), np.diff(stiffness.indptr))
     diagonal = stiffness.indices == local_rows+lo
@@ -249,6 +281,8 @@ def local_direct_inputs(config, p, legacy, bridge, matrix, pair, components, geo
     paths.eliminate_zeros()
     reach = abs(contacts)+abs(paths)
     reach.sort_indices()
+    if context:
+        reach = extended_reach(config, p, legacy, bridge, pair, neighbors, strengths, reach, x)
     algebra = pack(dict(student_candidates=16, student_library=config["student_library"]),
         pair.markers, np.ones(n), reach, -contacts, -paths, x)["cols"]
     novel = (algebra >= 0) & ~np.any(algebra[:, :, None] == geom[:, None, :], axis=2)
@@ -265,7 +299,7 @@ def local_direct_inputs(config, p, legacy, bridge, matrix, pair, components, geo
     same = (coarse_native[safe]%3 == comp[:,None]) & (columns >= 0)
     radial = same/(.25+distance**2)
     radial /= np.maximum(radial.sum(axis=1, keepdims=True), 1e-30)
-    edges = np.zeros(columns.shape+(LOCAL_EDGE_FEATURES,), dtype=np.float32)
+    edges = np.zeros(columns.shape+(CONTEXT_EDGE_FEATURES if context else LOCAL_EDGE_FEATURES,), dtype=np.float32)
     edges[:,:,0:3] = np.clip(delta,-6,6)
     edges[:,:,3:6] = np.minimum(np.abs(delta),6)
     edges[:,:,6] = np.minimum(distance,6)
@@ -279,7 +313,103 @@ def local_direct_inputs(config, p, legacy, bridge, matrix, pair, components, geo
     edges[:,:,13:17] = x[:,None,[0,1,4,5]]
     nearest = np.min(np.where(same, distance, 6), axis=1)
     edges[:,:,17] = np.minimum(nearest[:,None],6)
-    return dict(cols=columns, edges=edges, x=x), injection(pair), p.maximum(time.perf_counter()-start)
+    candidate = dict(cols=columns, edges=edges, x=x)
+    if context:
+        if len(r):
+            edges[r,c,18] = np.arcsinh(20*np.asarray(reach[r,picked]).ravel())
+        edges[:,:,19:22] = np.eye(3, dtype=np.float32)[coarse_native[safe]%3]
+        scale = np.maximum(np.ptp(xyz,axis=0), 1e-30)
+        nodes = np.column_stack((x[:,:5], phi[fine_nodes], (fine_xyz-xyz.min(axis=0))/scale,
+                                 np.eye(3)[comp], pair.markers == -3)).astype(np.float32)
+        strengths /= np.maximum(np.abs(strengths).sum(axis=1,keepdims=True), 1e-30)
+        membership = .02+radial+.1*np.abs(edges[:,:,9:11]).sum(axis=2)+.1*edges[:,:,18]
+        pooling = row_csr(columns, membership, columns >= 0, cols[-1])
+        packed = p.reduce(pooling.T @ np.column_stack((nodes,np.ones(n))))
+        pooled = packed[:,:-1]/np.maximum(packed[:,-1:], 1e-30)
+        candidate.update(nodes=nodes,neighbors=neighbors,strengths=strengths.astype(np.float32),
+                         pooled=pooled.astype(np.float32))
+    return candidate, injection(pair), p.maximum(time.perf_counter()-start)
+
+
+def context_layers(width):
+    return ((CONTEXT_NODE_FEATURES,width), (3*width,width), (CONTEXT_NODE_FEATURES,width),
+            (CONTEXT_EDGE_FEATURES+3*width,width), (3*width,width), (width,2), (3*width,4))
+
+
+def coarse_rows(p, pair, local):
+    values = np.zeros((pair.owners[-1], local.shape[1]), dtype=np.float64)
+    values[pair.injection_columns] = local[pair.injection_rows]
+    return p.reduce(values).astype(np.float32)
+
+
+def context_numpy_decode(raw, scores, budget_logits, valid):
+    rank_scores = np.where(valid, np.rint(CONTEXT_SCORE_SCALE*scores), -np.inf)
+    order = np.argsort(-rank_scores,axis=1,kind="stable")
+    rank = np.empty_like(order)
+    np.put_along_axis(rank, order, np.arange(order.shape[1])[None,:],axis=1)
+    budget = np.asarray(CONTEXT_BUDGETS)[np.argmax(np.rint(CONTEXT_SCORE_SCALE*budget_logits),axis=1)]
+    selected = (rank < budget[:,None]) & valid
+    return np.where(selected,raw,0), selected.sum(axis=1).astype(np.uint8)
+
+
+def context_parameters(width, parameters):
+    offset = 0
+    layers = []
+    for inputs, outputs in context_layers(width):
+        size = inputs*outputs
+        matrix = parameters[offset:offset+size].reshape(outputs,inputs)
+        layers.append((matrix,parameters[offset+size:offset+size+outputs]))
+        offset += size+outputs
+    assert offset == len(parameters)
+    return layers
+
+
+def context_edge_output(layers, fine, coarse, pooled, edges, columns):
+    """Rank-local row and coarse-context decoding before sparsification."""
+    valid = columns >= 0
+    safe = np.maximum(columns,0)
+    valid3 = valid[:,:,None]
+    width, edge_width = fine.shape[1], edges.shape[2]
+    w, bias = layers[3]
+    anchor = (coarse @ w[:,edge_width+width:edge_width+2*width].T+
+              pooled @ w[:,edge_width+2*width:].T)
+    local = fine @ w[:,edge_width:edge_width+width].T
+    base = (edges.reshape((-1,edge_width)) @ w[:,:edge_width].T).reshape(columns.shape+(width,))
+    hidden = np.maximum(base+local[:,None,:]+anchor[safe]+bias,0)
+    mean = (hidden*valid3).sum(axis=1)/np.maximum(valid.sum(axis=1,keepdims=True),1).astype(np.float32)
+    maximum = (hidden*valid3).max(axis=1)
+    c = np.concatenate((mean,maximum),axis=1)
+    w, bias = layers[4]
+    base = (hidden.reshape((-1,width)) @ w[:,:width].T).reshape(hidden.shape)
+    refined = np.maximum(base+(c @ w[:,width:].T)[:,None,:]+bias,0)
+    raw = (refined.reshape((-1,width)) @ layers[5][0].T+layers[5][1]).reshape(columns.shape+(2,))
+    budget = np.concatenate((fine,c),axis=1) @ layers[6][0].T+layers[6][1]
+    return raw[:,:,0],raw[:,:,1],budget
+
+
+def context_node_output(layers, center, neighbors, strengths):
+    message = np.concatenate((center,(neighbors*np.abs(strengths)[:,:,None]).sum(axis=1),
+                              (neighbors*strengths[:,:,None]).sum(axis=1)),axis=1)
+    return np.maximum(message @ layers[1][0].T+layers[1][1],0)
+
+
+def predict_context(p, candidate, pair, width, params):
+    layers = context_parameters(width, params)
+    center = np.maximum(candidate["nodes"] @ layers[0][0].T+layers[0][1],0)
+    neighbors = neighbour_blocks(p,pair.fine_owners,center,candidate["neighbors"])
+    fine = context_node_output(layers,center,neighbors,candidate["strengths"])
+    coarse = coarse_rows(p,pair,fine)
+    pooled = np.maximum(candidate["pooled"] @ layers[2][0].T+layers[2][1],0)
+    columns, edges = candidate["cols"], candidate["edges"]
+    values = np.zeros(columns.shape,dtype=np.float32)
+    budgets = np.zeros(len(columns),dtype=np.uint8)
+    for start in range(0,len(columns),1024):
+        part = slice(start,start+1024)
+        raw,scores,logits = context_edge_output(layers,fine[part],coarse,pooled,edges[part],columns[part])
+        if not np.isfinite(raw).all() or not np.isfinite(scores).all() or not np.isfinite(logits).all():
+            raise ValueError("Nonfinite graph interpolation output")
+        values[part],budgets[part] = context_numpy_decode(raw,scores,logits,columns[part]>=0)
+    return values,budgets
 
 
 def predict_local(config, candidate, markers, width, params):
@@ -330,7 +460,7 @@ def load_student(path, sha256, level):
         width, kind, cap = int(f["width"]), int(f["kind"]), int(f["candidates"])
         params = np.ascontiguousarray(f["params"], np.float32)
     assert kind in STUDENT_KINDS.values() and np.isfinite(params).all()
-    assert 1 <= width <= (32 if kind == STUDENT_KINDS["E"] else 16)
+    assert 1 <= width <= (32 if kind >= STUDENT_KINDS["E"] else 16)
     return width, kind, cap, params
 
 
@@ -420,7 +550,8 @@ def teacher_on_support(candidate, pair, control, model_support):
     """Keep original teacher coefficients in the unit-injection coordinates."""
     target = normalized_teacher(pair)
     free = np.flatnonzero(pair.markers == -1)
-    assert control in ("candidates", "top6", "model_support")
+    assert control in ("candidates", "top6", "top12", "model_support")
+    top = {"top6": 6, "top12": 12}.get(control)
     columns = candidate["cols"].copy()
     values = np.zeros(columns.shape, dtype=np.float64)
     # Use full precision values for the controlled solves.
@@ -435,8 +566,8 @@ def teacher_on_support(candidate, pair, control, model_support):
         matched = source[indices] == columns[row, selected]
         selected, indices = selected[matched], indices[matched]
         weights = target.data[start+indices]
-        if control == "top6":
-            order = np.argsort(-np.abs(weights), kind="stable")[:6]
+        if top is not None:
+            order = np.argsort(-np.abs(weights), kind="stable")[:top]
             selected, weights = selected[order], weights[order]
         if len(selected):
             values[row, selected] = weights
@@ -450,6 +581,10 @@ def teacher_on_support(candidate, pair, control, model_support):
 
 
 def direct_graph(config, kind):
+    if kind == "F":
+        assert config["direct_local"]["min_entries"] == CONTEXT_BUDGETS[0]
+        assert config["direct_local"]["max_entries"] == CONTEXT_BUDGETS[-1]
+        return dict(kind=kind, path_steps=config["context_path_steps"], **config["direct_local"])
     if kind == "E":
         return dict(kind=kind, **config["direct_local"])
     return dict(hops=config["direct_hops"], candidates=config["direct_candidates"])
@@ -457,12 +592,13 @@ def direct_graph(config, kind):
 
 def direct_level(config, p, legacy, bridge, matrix, pair, components, model, control=None, geometry=None):
     width, kind, cap, params = load_student(model["path"], model["sha256"], 1)
-    local = kind == STUDENT_KINDS["E"]
+    context = kind == STUDENT_KINDS["F"]
+    local = kind >= STUDENT_KINDS["E"]
     assert local or kind == STUDENT_KINDS["D"]
     if local:
-        assert control is None and model["graph"] == direct_graph(config, "E")
+        assert model["graph"] == direct_graph(config, "F" if context else "E")
         candidate, seeds, candidate_s = local_direct_inputs(config, p, legacy, bridge, matrix, pair,
-                                                           components, geometry)
+            components, geometry, context=context or control == "context_candidates")
     else:
         candidate, seeds, candidate_s = direct_inputs(config, p, legacy, bridge, matrix, pair, components)
     assert cap == candidate["cols"].shape[1]
@@ -473,7 +609,9 @@ def direct_level(config, p, legacy, bridge, matrix, pair, components, model, con
         begin = time.perf_counter()
         invalid = False
         try:
-            if local:
+            if context:
+                values, budgets = predict_context(p, candidate, pair, width, params)
+            elif local:
                 values, budgets = predict_local(config, candidate, pair.markers, width, params)
             else:
                 comp = p.all_rows(pair.components, pair.owners).astype(np.int32)
@@ -487,7 +625,8 @@ def direct_level(config, p, legacy, bridge, matrix, pair, components, model, con
     columns = candidate["cols"]
     guard_rows = 0
     if control is not None:
-        columns, values, guard_rows = teacher_on_support(candidate, pair, control,
+        columns, values, guard_rows = teacher_on_support(candidate, pair,
+            "candidates" if control == "context_candidates" else control,
             values != 0 if values is not None else None)
     learned = row_csr(columns, values.astype(np.float64), values != 0, seeds.shape[1])
     assert not learned[~free].nnz
@@ -513,9 +652,9 @@ def export_direct_teacher(config, p, legacy, bridge, row, matrix, pair, componen
     """Export signed unit-injection labels; keep full hierarchy shard provenance."""
     assert row["split"] == "training" and directions
     kind = config.get("direct_teacher_kind", "D")
-    if kind == "E":
+    if kind in ("E", "F"):
         candidate, _, candidate_s = local_direct_inputs(config, p, legacy, bridge, matrix, pair,
-                                                        components, geometry)
+                                                        components, geometry, context=kind == "F")
     else:
         candidate, _, candidate_s = direct_inputs(config, p, legacy, bridge, matrix, pair, components)
     target = normalized_teacher(pair)
@@ -545,9 +684,21 @@ def export_direct_teacher(config, p, legacy, bridge, row, matrix, pair, componen
     counts = p.gather_equal([len(indices)]).ravel().astype(np.int64)
     owners = np.r_[0, np.cumsum(counts)]
     coeff, mass, covered = match_targets(candidate, target, indices)
-    sampled = dict(**{name: v[indices] for name, v in candidate.items()},
+    row_arrays = ("cols","edges","x","nodes","strengths") if kind == "F" else tuple(candidate)
+    sampled = dict(**{name: candidate[name][indices] for name in row_arrays},
                    target=coeff, norm_teacher=mass, norm_covered=covered)
-    if kind == "E":
+    coarse_features = {}
+    if kind == "F":
+        neighbors = neighbour_blocks(p,pair.fine_owners,candidate["nodes"],candidate["neighbors"])
+        sampled.update(neighbor_nodes=neighbors[indices], region=np.full(len(indices),p.rank//4,dtype=np.int32))
+        n = len(candidate["nodes"])
+        bundle = np.column_stack((candidate["nodes"],neighbors.reshape((n,8*CONTEXT_NODE_FEATURES)),
+                                  candidate["strengths"]))
+        coarse = coarse_rows(p,pair,bundle)
+        coarse_features = dict(coarse_nodes=coarse[:,:CONTEXT_NODE_FEATURES],
+            coarse_neighbor_nodes=coarse[:,CONTEXT_NODE_FEATURES:-8].reshape((-1,8,CONTEXT_NODE_FEATURES)),
+            coarse_strengths=coarse[:,-8:],pooled=candidate["pooled"])
+    if kind in ("E", "F"):
         sampled["row_sum"] = np.asarray(target[indices].sum(axis=1)).ravel().astype(np.float32)
     values = {kind+"_"+name: gather_array(p, v, owners) for name, v in sampled.items()}
     action = gather_array(p, (target[indices] @ q).astype(np.float32), owners)
@@ -556,7 +707,8 @@ def export_direct_teacher(config, p, legacy, bridge, row, matrix, pair, componen
     job = os.environ["GNN_RUN_ID"]
     file = Path(config["output_directory"])/"data"/("direct-%s-%s-samples.npz" % (job, row["key"]))
     with file.open("xb") as stream:
-        np.savez(stream, **values, q=q.astype(np.float32), action=action, coarse_native=coarse_native)
+        np.savez(stream, **values, **coarse_features, q=q.astype(np.float32), action=action,
+                 coarse_native=coarse_native)
     return dict(key=row["key"], split=row["split"], level=1, rows=int(owners[-1]),
         real_directions=len(directions), student_feedback_directions=feedback_count,
         candidate_s=candidate_s, coverage=coverage,
