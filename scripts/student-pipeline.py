@@ -102,6 +102,8 @@ class Pipeline:
         write_state(self.path, self.state)
 
     def update_run(self, phase, job):
+        if self.plan["mode"] in ("direct", "direct_refine"):
+            return  # The pilot keeps its own state and frozen configurations.
         path = Path(self.plan["run_record"])
         current = read(path)
         current["student_development"] = dict(pipeline=str(self.path), name=self.study,
@@ -194,7 +196,7 @@ class Pipeline:
             self.verify_models(exports)
             entry.update(exports=exports,device_name=report["device_name"],elapsed_seconds=report["elapsed_seconds"])
         else:
-            if report.get("mode") in ("data","refresh"):
+            if report.get("mode") in ("data","refresh","direct_data"):
                 entry["samples"] = {level:len(rows) for level,rows in report["samples"].items()}
                 entry["accepted"] = report["accepted"]
             entry["totals"] = report.get("totals",report.get("best",{}).get("totals",{}))
@@ -231,6 +233,10 @@ class Pipeline:
             student_evaluation_split=split,student_methods=methods,student_repeats=repeats))[0]
 
     def run(self):
+        if self.plan["mode"] == "direct":
+            return self.run_direct()
+        if self.plan["mode"] == "direct_refine":
+            return self.run_direct_refinement()
         reference = dict(name="reference")
         smoke = self.plan["mode"] == "smoke"
         if smoke:
@@ -266,6 +272,78 @@ class Pipeline:
         self.save()
         self.update_run("complete",None)
         print("STUDENT_PIPELINE_VERIFIED",self.study,flush=True)
+
+    def run_direct(self):
+        keys = self.base["gate_keys"]
+        report, data = self.stage("data", dict(student_cycle="direct_data", student_keys=keys))
+        receipts = report["samples"]["1"]
+        assert report["accepted"] and {r["key"] for r in receipts} == set(keys)
+        epochs = self.plan["epochs"]
+        trained, _ = self.stage("train", dict(student_datasets=[data], student_full_training=False,
+            student_runs=[dict(level=1, kind="D", seed=20261109, width=16, epochs=epochs,
+                               checkpoints=[epochs])]), training=True)
+        model = trained["runs"][0]["checkpoints"][0]
+        methods = [dict(name="teacher_roundtrip"), dict(name="direct_p1", students={"p1":model}),
+                   self.base["direct_student_control"]]
+        paired, _ = self.stage("paired", dict(student_cycle="evaluate", student_keys=keys,
+            student_evaluation_split="training", student_methods=methods, student_repeats=2,
+            student_reference="student"))
+        assert paired["totals"]["teacher_roundtrip"]["failed"] == 0
+        assert all(stats["frames"] == 2*len(keys) for stats in paired["totals"].values())
+        self.state["final"] = dict(scope="teacher endpoints on training frames", model=model,
+            coverage={r["key"]:r["coverage"] for r in receipts}, cases=paired["cases"],
+            totals=paired["totals"], direct_p1_passed=paired["totals"]["direct_p1"]["failed"] == 0)
+        self.state["status"] = "direct_pilot_measured"
+        self.save()
+        print("DIRECT_P1_PILOT_MEASURED", self.study, flush=True)
+
+    def run_direct_refinement(self):
+        keys = self.base["gate_keys"]
+        prior = dict(name="direct_v1", direct=True, students={"p1":self.base["direct_prior_model"]})
+        controls = [dict(prior, name="teacher_"+control, teacher_control=control)
+                    for control in ("candidates", "top6", "model_support")]
+        diagnosis, _ = self.stage("diagnose", dict(student_cycle="diagnose", student_keys=keys,
+            student_evaluation_split="training", student_methods=controls, student_repeats=1))
+        assert len(diagnosis["cases"]) == 3*len(keys)
+        self.state["diagnosis"] = dict(cases=diagnosis["cases"], totals=diagnosis["totals"])
+        self.save()
+
+        report, data = self.stage("data", dict(student_cycle="direct_data", student_keys=keys,
+                                               direct_teacher_kind="E"))
+        receipts = report["samples"]["1"]
+        assert report["accepted"] and {r["key"] for r in receipts} == set(keys)
+        epochs = self.plan["epochs"]
+        trained, _ = self.stage("train", dict(student_datasets=[data], student_full_training=False,
+            student_runs=[dict(level=1, kind="E", seed=20261109, width=24, epochs=epochs,
+                               batch_rows=4096, learning_rate=.003,
+                               checkpoints=[3*epochs//4, epochs])]), training=True)
+        candidates = [dict(name="direct_e%02d"%model["epoch"], direct=True, students={"p1":model})
+                      for model in trained["runs"][0]["checkpoints"]]
+        current = self.base["direct_student_control"]
+        screen, _ = self.stage("screen", dict(student_cycle="evaluate", student_keys=keys,
+            student_evaluation_split="training", student_methods=[current]+candidates,
+            student_repeats=1, student_reference="student"))
+        winner = self.best(screen, candidates)
+        methods = [dict(name="retained_base"), dict(name="teacher_roundtrip"), current, prior,
+                   dict(winner,name="direct_v2")]
+        paired, _ = self.stage("paired", dict(student_cycle="evaluate", student_keys=keys,
+            student_evaluation_split="training", student_methods=methods, student_repeats=2,
+            student_reference="student"))
+        totals = paired["totals"]
+        assert set(totals) == {method["name"] for method in methods}
+        assert all(stats["frames"] == 2*len(keys) for stats in totals.values())
+        assert totals["retained_base"]["failed"] == totals["teacher_roundtrip"]["failed"] == 0
+        repeat_totals = [{method:sum(r["total_s"] for r in paired["cases"]
+                          if r["method"]==method and r["repeat"]==repeat) for method in totals}
+                         for repeat in range(2)]
+        passed = not totals["direct_v2"]["failed"] and all(
+            r["direct_v2"] <= .90*r["student"] for r in repeat_totals)
+        self.state["final"] = dict(scope="teacher endpoints on training frames", model=winner["students"]["p1"],
+            screening=screen["totals"], coverage={r["key"]:r["coverage"] for r in receipts},
+            cases=paired["cases"], totals=totals, repeat_totals=repeat_totals, target_speed_gate=passed)
+        self.state["status"] = "direct_refinement_measured"
+        self.save()
+        print("DIRECT_P1_REFINEMENT_MEASURED", self.study, flush=True)
 
     def finish_full(self, reference, dev, p1, p2):
         valid = self.base["training"]["validation_keys"]

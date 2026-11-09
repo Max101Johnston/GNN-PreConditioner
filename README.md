@@ -232,6 +232,43 @@ The deployment entry point in this repository is the saved-matrix
 FieldSplit replay. A positive speed gate is the prerequisite for the
 separate continuous OGS restart comparison.
 
+### Direct first-transfer pilot
+
+`scripts/student-pipeline.py` also accepts a plan with `mode=direct`. Its base
+configuration names training-only `gate_keys` with complete retained L0/L3/L5
+receipts, `direct_hops`, `direct_candidates`, and a frozen `direct_student_control`.
+The data stage imports the retained transfers under their original column
+numbering and scaling, rebuilds both Galerkin products, and compares complete
+solves with the retained reference. It exports signed unit-injection P1 labels
+with per-frame coverage and the original transfer receipt. Data paths and the
+pilot state are external to the source tree.
+
+The D student predicts signed weights and support priorities from bounded
+path features of the current stiffness matrix and supplied coarse DOFs.
+PETSc communicates paths across MPI ownership boundaries. The prediction path
+uses no multipass seed or teacher P1 coefficients. The pilot uses the teacher's
+C1, C2 and rebased P2 to isolate P1, then compares complete replay time and true
+residuals with both the round-trip and the frozen v1 student. Its training-frame
+results are a numerical and timing diagnostic.
+
+The `direct_refine` plan runs three coefficient controls for each training
+frame, using the frozen D model and its candidates. The controls retain all
+teacher entries in the candidates, the six largest teacher entries there, or
+the teacher entries selected by D. An empty intersection gets the single
+largest original teacher coefficient, and each report counts those rows.
+Each transfer rebuilds both Galerkin operators with the same coarse IDs and P2.
+
+Student E generates its own weights using component-local geometric neighbors
+and signed one- and two-hop stiffness contacts. The local path uses one PETSc
+sparse product. Teacher-derived support labels supervise the ranking alongside
+signed coefficients, row sums and correction samples, including early,
+middle and late inputs from the frozen D solve evaluated through the teacher.
+Training switches from
+dense output to the same hard support rule used in native inference. The
+`direct_local` configuration controls the candidate widths, support bounds
+and score cutoff. The final paired replay compares the selected E checkpoint
+with D, the frozen online student, the rebuilt teacher and the cached teacher.
+
 ### Continuous OGS comparison
 
 The opt-in `student_live` stage uses the existing OGS/PETSc SIF and the

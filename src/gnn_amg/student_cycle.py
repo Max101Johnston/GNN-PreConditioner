@@ -31,7 +31,10 @@ def compact(result, frame, method, elapsed=None, fallback=None):
         p1_candidate_s=first.get("candidate_s"), p1_inference_s=first.get("native_inference_s"),
         p2_candidate_s=second.get("candidate_s"), p2_inference_s=second.get("native_inference_s"),
         p1_budget_counts=first.get("budget_counts"),
+        p1_budget_options=first.get("budget_options"),
+        teacher_guard_rows=first.get("teacher_guard_rows"),
         galerkin_errors=n.get("galerkin_errors"), fallback=fallback,
+        feedback_pc_apply_calls=result.get("feedback_pc_apply_calls"),
         teacher=result.get("student_teacher"))
 
 
@@ -72,7 +75,7 @@ def retained_teacher(config, row):
 
 
 def run_cycle(config, p, replay, legacy, bridge, inventory):
-    from .gate import run_method
+    from .gate import RetainedFirst, load_teacher, run_method
 
     mode = config["student_cycle"]
     workers = config["parallel_workers"]
@@ -87,6 +90,7 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
     refresh = config.get("refresh_p1")
     if refresh:
         load_student(refresh["path"], refresh["sha256"], 1)
+    feedback = {}
 
     def load(key):
         return load_observed_state(config, p, replay, frames[key])
@@ -100,11 +104,26 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
         layout, fields, data = loaded
         row, label = frames[key], method["name"]
         models = method.get("students", {})
+        direct = label == "direct_p1" or method.get("direct", False)
         if label in ("amg", "retained_base"):
             teacher = retained_teacher(config, row) if label == "retained_base" else None
             if label == "retained_base" and teacher is None:
                 return None
             result = run_method(config, p, replay, legacy, bridge, row, layout, data, label, teacher)
+        elif label == "teacher_roundtrip" or direct:
+            teacher = load_teacher(config, p, row, layout)
+            teacher["pair"] = RetainedFirst(config, p, legacy, row, teacher, assemble=False)
+            teacher["geometry"] = (layout["xyz"], fields["phi"])
+            if direct:
+                teacher.update(direct_model=models["p1"], direct_control=method.get("teacher_control"))
+            if method.get("capture_apply"):
+                teacher["capture_apply"] = feedback.setdefault(key, [])
+            if method.get("export_direct"):
+                lo, hi = teacher["pair"].fine_owners[p.rank:p.rank+2]
+                teacher.update(export_direct=True, phase=fields["phi"][teacher["native"][lo:hi]//3],
+                               feedback_inputs=feedback.pop(key, []))
+            solver_method = "direct_p1" if direct else label
+            result = run_method(config, p, replay, legacy, bridge, row, layout, data, solver_method, teacher)
         else:
             context = dict(policy="prior_only", fast_prior=True, tag=tag, p1_refinement_sweeps=2,
                            students=models, export_teacher_level=export_level,
@@ -120,7 +139,7 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
                                   context=context)
         fallback = None
         elapsed = result.get("total_wall_s", result["setup_wall_s"])
-        if models and not result["reached_true_target"] and method.get("fallback", False):
+        if not direct and models and not result["reached_true_target"] and method.get("fallback", False):
             safe = solve_policy(config, p, replay, legacy, bridge, None, row, layout, fields, data,
                 context=dict(policy="prior_only", fast_prior=True, tag=tag+"-fallback",
                              p1_refinement_sweeps=2, archive_choices=False))
@@ -163,7 +182,28 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
 
     report = dict(job=job, mode=mode, workers=workers, cpu_ranks=p.global_size)
     status = 0
-    if mode in ("data", "refresh"):
+    if mode == "direct_data":
+        keys = config["student_keys"]
+        assert len(set(keys)) == len(keys) and set(keys) <= set(train)
+        feedback_cases = []
+        if config.get("direct_teacher_kind") == "E":
+            prior = dict(name="direct_feedback", direct=True, capture_apply=True,
+                         students={"p1":config["direct_prior_model"]})
+            feedback_cases = evaluate(keys, [prior], "direct_feedback")
+            assert all(row["passed"] for row in feedback_cases)
+        results = evaluate(keys, [dict(name="retained_base"),
+                                  dict(name="teacher_roundtrip", export_direct=True)], mode)
+        cases = {(r["key"], r["method"]): r for r in results}
+        roundtrip = [cases[(key, "teacher_roundtrip")] for key in keys]
+        accepted = all(r["passed"] and r["teacher"] and
+                       cases[(r["key"], "retained_base")]["passed"] and
+                       r["iterations"] == cases[(r["key"], "retained_base")]["iterations"]
+                       for r in roundtrip)
+        report.update(keys=keys, cases=results, totals=method_totals(results), accepted=accepted,
+                      feedback_cases=feedback_cases,
+                      samples={"1": [r["teacher"] for r in roundtrip if r["teacher"]]})
+        status = 0 if accepted else 2
+    elif mode in ("data", "refresh"):
         keys = config.get("student_keys") or train
         assert len(set(keys)) == len(keys) and set(keys) <= set(train)
         levels = [2] if mode == "refresh" else config.get("student_teacher_levels", [1, 2])
@@ -198,15 +238,19 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
         report.update(keys=keys, samples=records_by_level, cases=result, totals=method_totals(result),
                       minimum_samples=minimum, accepted=accepted)
         status = 0 if accepted or mode == "refresh" else 2
-    elif mode in ("evaluate", "confirm"):
+    elif mode in ("evaluate", "confirm", "diagnose"):
         keys = config["student_keys"]
         split = config["student_evaluation_split"]
         assert len(set(keys)) == len(keys) and all(frames[k]["split"] == split for k in keys)
         cases = evaluate(keys, methods, mode, repeats=config.get("student_repeats", 1))
         totals = method_totals(cases)
         report.update(keys=keys, split=split, methods=methods, cases=cases, totals=totals)
-        assert totals["reference"]["frames"] == len(keys)*config.get("student_repeats", 1)
-        status = 2 if totals["reference"]["failed"] else 0
+        if mode == "diagnose":
+            assert len(cases) == len(keys)*len(methods)
+        else:
+            reference = config.get("student_reference", "reference")
+            assert totals[reference]["frames"] == len(keys)*config.get("student_repeats", 1)
+            status = 2 if totals[reference]["failed"] else 0
     elif mode == "tune":
         assert workers == 3 and len(methods) == 1
         method = methods[0]

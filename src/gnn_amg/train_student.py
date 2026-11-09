@@ -10,7 +10,8 @@ import torch
 from torch import nn
 
 from .backend import digest, read_json, record
-from .student import DEFAULT_CONTROL, EDGE_FEATURES, ROW_FEATURES, SCHEMA, predict
+from .student import (DEFAULT_CONTROL, EDGE_FEATURES, LOCAL_EDGE_FEATURES, ROW_FEATURES,
+                      SCHEMA, STUDENT_KINDS, direct_graph, predict, predict_local)
 
 
 class InterpolationStudent(nn.Module):
@@ -19,7 +20,7 @@ class InterpolationStudent(nn.Module):
         self.kind = kind
         self.row = nn.Sequential(nn.Linear(ROW_FEATURES, width), nn.ReLU(), nn.Linear(width, 4))
         self.edge = (nn.Sequential(nn.Linear(EDGE_FEATURES, width), nn.ReLU(), nn.Linear(width, 2))
-                     if kind == "B" else None)
+                     if kind in ("B", "D") else None)
         with torch.no_grad():
             self.row[-1].weight.mul_(0.02)
             self.row[-1].bias.copy_(torch.tensor([0., 0., .3, 0.]))
@@ -36,10 +37,11 @@ class InterpolationStudent(nn.Module):
             shape = valid.shape
             z = torch.cat((hints/norm[:, None, None], same[:, :, None],
                 x[:, None, [1, 4, 6]].expand(-1, shape[1], -1)), dim=2)
-            e = self.edge(z).clamp(-1, 1)
-            raw = raw+hints[:, :, 2]+norm[:, None]*e[:, :, 0]
-            shift = e[:, :, 1]
-        scores = raw.abs()/norm[:, None]+shift
+            edge = self.edge(z)
+            bounded = edge.clamp(-1, 1)
+            raw = edge[:, :, 0] if self.kind == "D" else raw+hints[:, :, 2]+norm[:, None]*bounded[:, :, 0]
+            shift = bounded[:, :, 1]
+        scores = (raw.abs() if self.kind == "D" else raw.abs()/norm[:, None])+shift
         available = valid & (raw != 0)
         masked = torch.where(available, scores, -1e8)
         order = torch.argsort(masked, dim=1, descending=True, stable=True)
@@ -66,19 +68,45 @@ class InterpolationStudent(nn.Module):
             [p.detach().cpu().numpy().ravel() for p in self.parameters()]), dtype=np.float32)
 
 
+class LocalInterpolationStudent(InterpolationStudent):
+    def __init__(self, width, options):
+        nn.Module.__init__(self)
+        self.kind = "E"
+        self.edge = nn.Sequential(nn.Linear(LOCAL_EDGE_FEATURES, width), nn.ReLU(), nn.Linear(width, 2))
+        self.options = options
+
+    def forward(self, edges):
+        return self.edge(edges).unbind(dim=-1)
+
+    def select(self, weights, scores, valid):
+        available = valid & (weights != 0)
+        order = torch.argsort(scores.masked_fill(~available, -torch.inf), dim=1,
+                              descending=True, stable=True)
+        rank = torch.empty_like(order).scatter_(1, order,
+            torch.arange(order.shape[1], device=order.device).expand_as(order))
+        return available & (rank < self.options["max_entries"]) & (
+            (rank < self.options["min_entries"]) | (scores >= self.options["score_cutoff"]))
+
+
 def verified_frames(config):
     records = config["student_datasets"]
     frames = {}
     for path in records:
         report = read_json(path)
-        assert report["accepted"] and report["mode"] in ("data", "refresh")
+        assert report["accepted"] and report["mode"] in ("data", "refresh", "direct_data")
         cases = {(r["key"], r["method"]):r for r in report["cases"]}
         for level, receipts in report["samples"].items():
             for r in receipts:
                 assert r["split"] == "training" and r["real_directions"] > 0
                 for entry in ("samples", "transfers"):
                     assert digest(r[entry]["path"]) == r[entry]["sha256"], r[entry]["path"]
-                case = cases[(r["key"], "teacher_L"+level)]
+                if report["mode"] == "direct_data":
+                    method = "teacher_roundtrip"
+                    kind = r["graph"].get("kind", "D")
+                    assert r["graph"] == direct_graph(config, kind)
+                else:
+                    method = "teacher_L"+level
+                case = cases[(r["key"], method)]
                 assert case["passed"] and case["final_true_residual"] <= case["true_limit"]
                 frames.setdefault(int(level), []).append(dict(r, iterations=case["iterations"]))
     if config.get("student_full_training"):
@@ -92,25 +120,34 @@ def load_training_rows(receipts, kind, device):
     probe = None
     for receipt in receipts:
         with np.load(receipt["samples"]["path"], allow_pickle=False) as d:
-            names = ("x", "hints", "norm", "cols", "target", "norm_teacher")
+            names = ("x", "cols", "target", "norm_teacher")
+            names += ("edges", "row_sum") if kind == "E" else ("hints", "norm")
             a = {n: d[kind+"_"+n] for n in names}
             n, cap = a["cols"].shape
-            assert cap >= 12 and a["hints"].shape == (n, cap, 3)
+            assert cap >= 12
             comp = (d["coarse_native"]%3).astype(np.int32)
             assert np.all((a["cols"] >= -1) & (a["cols"] < len(comp)))
             valid = a["cols"] >= 0
             safe = np.maximum(a["cols"], 0)
             q = d["q"][safe].astype(np.float32)
             q *= valid[:, :, None]
-            same = (comp[safe] == (2*a["x"][:, 5:6])).astype(np.float32)
             action = d["action"]
-            all_frames.append(dict(x=a["x"], hints=a["hints"], norm=a["norm"], same=same,
-                valid=valid, target=a["target"], norm_teacher=a["norm_teacher"], q=q,
-                action=action, frame_weight=np.full(n, np.clip(np.sqrt(receipt["iterations"]/median),
-                    .7, 1.6), dtype=np.float32)))
+            if kind == "E":
+                assert a["edges"].shape == (n, cap, LOCAL_EDGE_FEATURES)
+                component = (2*a["x"][:, 5]).astype(np.int32)
+                frame_weight = n/(3*np.bincount(component, minlength=3)[component])
+                inputs = dict(edges=a["edges"], row_sum=a["row_sum"])
+            else:
+                assert a["hints"].shape == (n, cap, 3)
+                same = (comp[safe] == (2*a["x"][:, 5:6])).astype(np.float32)
+                frame_weight = np.full(n, np.clip(np.sqrt(receipt["iterations"]/median), .7, 1.6))
+                inputs = dict(hints=a["hints"], norm=a["norm"], same=same)
+            all_frames.append(dict(x=a["x"], valid=valid, target=a["target"], norm_teacher=a["norm_teacher"],
+                q=q, action=action, frame_weight=frame_weight.astype(np.float32), **inputs))
             if probe is None and n:
                 keep = min(n, 192)
-                probe = ({name:np.ascontiguousarray(a[name][:keep]) for name in ("x","hints","norm","cols")}, comp)
+                probe_names = ("x", "cols") + (("edges",) if kind == "E" else ("hints", "norm"))
+                probe = ({name:np.ascontiguousarray(a[name][:keep]) for name in probe_names}, comp)
     assert probe is not None
     data = {name: torch.as_tensor(np.concatenate([f[name] for f in all_frames]), device=device)
             for name in all_frames[0]}
@@ -128,25 +165,60 @@ def loss_terms(model, data, indexes, budget, temperature):
     wd = d["frame_weight"]
     coeff_loss, action_loss = (coeff*wd).mean(), (effect*wd).mean()
     budget_loss = .025*torch.relu(expected.mean()-budget).square()+.001*expected.mean()
-    total = .55*coeff_loss+.45*action_loss+budget_loss
+    coeff_weight = .85 if model.kind == "D" else .55
+    total = coeff_weight*coeff_loss+(1-coeff_weight)*action_loss+budget_loss
     return total, torch.stack([coeff_loss, action_loss, expected.mean(),
                                (weights != 0).sum(1).float().mean()])
+
+
+def local_loss_terms(model, data, indexes, hard):
+    d = {name: value[indexes] for name, value in data.items()}
+    raw, scores = model(d["edges"])
+    valid, target = d["valid"], d["target"]
+    selected = model.select(raw, scores, valid) if hard else valid
+    dense = raw*valid
+    weights = raw*selected
+    norm = d["norm_teacher"].clamp_min(.05)
+    coeff = ((weights-target)/norm[:, None]).square().sum(1)
+    dense_error = ((dense-target)/norm[:, None]).square().sum(1)
+    # Independent ranking supervision favors large signed teacher entries and
+    # keeps the ranking trainable when the deployment mask is already hard.
+    positive = (target != 0) & valid
+    negative = ~positive & valid
+    ranking = nn.functional.smooth_l1_loss(scores, torch.log1p(8*target.abs()), reduction="none")
+    support = ((ranking*positive).sum(1)/positive.sum(1).clamp_min(1) +
+               (ranking*negative).sum(1)/negative.sum(1).clamp_min(1))/2
+    action = (weights[:, :, None]*d["q"]).sum(1)
+    action_scale = torch.maximum(d["action"].square().mean(1).sqrt(), .4*norm)
+    effect = ((action-d["action"])/action_scale[:, None]).square().mean(1)
+    sum_error = ((weights.sum(1)-d["row_sum"])/norm.clamp_min(.25)).square()
+    balance = d["frame_weight"]
+    total = ((.43*coeff+.10*dense_error+.25*support+.14*effect+.08*sum_error)*balance).mean()
+    return total, torch.stack([(coeff*balance).mean(), (effect*balance).mean(),
+                               (support*balance).mean(), selected.sum(1).float().mean()])
 
 
 def verify_native(config, model, probe, width):
     arrays, comp = probe
     markers = np.full(len(arrays["x"]), -1, np.int32)
-    safe = np.maximum(arrays["cols"], 0)
-    same = (comp[safe] == (2*arrays["x"][:, 5:6])).astype(np.float32)
     # Compare on CPU with TF32 disabled in training; both use float32
     # and a stable candidate-order tie break.
     device = next(model.parameters()).device
-    args = [arrays["x"], arrays["hints"], arrays["norm"], same, arrays["cols"] >= 0]
     model.eval()
-    with torch.no_grad():
-        expected, _, budget = model(*[torch.as_tensor(a, device=device) for a in args])
-    values, actual = predict(config, arrays, markers, comp, width, int(model.kind=="B"),
-                              model.packed(), DEFAULT_CONTROL)
+    if model.kind == "E":
+        with torch.no_grad():
+            raw, score = model(torch.as_tensor(arrays["edges"], device=device))
+            mask = model.select(raw, score, torch.as_tensor(arrays["cols"] >= 0, device=device))
+            expected, budget = raw*mask, mask.sum(1)
+        values, actual = predict_local(config, arrays, markers, width, model.packed())
+    else:
+        safe = np.maximum(arrays["cols"], 0)
+        same = (comp[safe] == (2*arrays["x"][:, 5:6])).astype(np.float32)
+        args = [arrays["x"], arrays["hints"], arrays["norm"], same, arrays["cols"] >= 0]
+        with torch.no_grad():
+            expected, _, budget = model(*[torch.as_tensor(a, device=device) for a in args])
+        values, actual = predict(config, arrays, markers, comp, width, STUDENT_KINDS[model.kind],
+                                  model.packed(), DEFAULT_CONTROL)
     expected, budget = expected.cpu().numpy(), budget.cpu().numpy()
     assert np.array_equal(budget, actual), "Export changed the hard budget"
     assert np.array_equal(values != 0, expected != 0), "Export changed the selected support"
@@ -173,7 +245,9 @@ def train(config):
         torch.manual_seed(seed)
         if device.type == "cuda":
             torch.cuda.manual_seed_all(seed)
-        model = InterpolationStudent(kind, width).to(device)
+        local = kind == "E"
+        model = (LocalInterpolationStudent(width, config["direct_local"]) if local
+                 else InterpolationStudent(kind, width)).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=run.get("learning_rate", .002))
         if "resume" in run:
             receipt = run["resume"]
@@ -185,6 +259,8 @@ def train(config):
         data, probe = load_training_rows(frames[level], kind, device)
         rows = len(data["x"])
         epochs = run["epochs"]
+        scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs, eta_min=.0003)
+                     if local else None)
         history, exports = [], []
         assert set(run["checkpoints"]) <= set(range(1,epochs+1)) and epochs in run["checkpoints"]
         for epoch in range(1, epochs+1):
@@ -194,16 +270,22 @@ def train(config):
             batch_size = run.get("batch_rows", 2048)
             target = 8. if level == 1 else 7.
             budget = 10-(10-target)*min(1., epoch/max(1,epochs//2))
+            hard = epoch > epochs//2
             for indices in order.split(batch_size):
                 optimizer.zero_grad(set_to_none=True)
-                loss, metrics = loss_terms(model, data, indices, budget, .22-.1*epoch/epochs)
+                loss, metrics = (local_loss_terms(model, data, indices, hard) if local
+                                 else loss_terms(model, data, indices, budget, .22-.1*epoch/epochs))
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 2., error_if_nonfinite=True)
                 optimizer.step()
                 aggregate += torch.cat((loss.detach().reshape(1), metrics.detach()))*len(indices)
+            if scheduler is not None:
+                scheduler.step()
             values = (aggregate/rows).detach().cpu().tolist()
             stats = dict(epoch=epoch, loss=values[0], coefficient_loss=values[1],
                 action_loss=values[2], soft_budget=values[3], hard_entries=values[4])
+            if local:
+                stats.update(support_loss=stats.pop("soft_budget"), hard_selection=hard)
             history.append(stats)
             record(config, "student_epoch", job=job, level=level, kind=kind, seed=seed, **stats)
             if epoch in run["checkpoints"]:
@@ -213,7 +295,7 @@ def train(config):
                 train_path = checkpoint_dir/(stem+".pt")
                 with native_path.open("xb") as f:
                     np.savez(f, schema=np.int32(SCHEMA), width=np.int32(width), level=np.int32(level),
-                        kind=np.int32(kind=="B"), candidates=np.int32(config["student_candidates"]),
+                        kind=np.int32(STUDENT_KINDS[kind]), candidates=np.int32(probe[0]["cols"].shape[1]),
                         params=model.packed())
                 with train_path.open("xb") as f:
                     torch.save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
@@ -223,6 +305,8 @@ def train(config):
                 exports.append(dict(name=stem, path=str(native_path), sha256=digest(native_path),
                     level=level, kind=kind, seed=seed, epoch=epoch, native_parity=parity,
                     training=dict(path=str(train_path), sha256=digest(train_path))))
+                if local:
+                    exports[-1]["graph"] = direct_graph(config, "E")
         reports.append(dict(level=level, kind=kind, width=width, seed=seed, samples=rows,
                             frames=len(frames[level]), history=history, checkpoints=exports))
         del data, model, optimizer

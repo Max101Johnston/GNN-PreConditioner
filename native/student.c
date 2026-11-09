@@ -3,7 +3,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-enum { ROW_FEATURES = 10, EDGE_FEATURES = 7, MAX_WIDTH = 16, MAX_CANDIDATES = 32 };
+enum { ROW_FEATURES = 10, EDGE_FEATURES = 7, LOCAL_EDGE_FEATURES = 18,
+       MAX_WIDTH = 32, MAX_CANDIDATES = 48 };
 
 struct candidate {
     int32_t col;
@@ -113,8 +114,8 @@ int gnn_student_predict(int n, int cap, int width, int kind, const float *params
     const int32_t *coarse_component, const float *rows, const float *hints,
     const float *norm, float *values, uint8_t *budget)
 {
-    if (cap < 12 || cap > MAX_CANDIDATES || width < 1 || width > MAX_WIDTH ||
-        kind < 0 || kind > 1) return 1;
+    if (cap < 12 || cap > 32 || width < 1 || width > 16 ||
+        kind < 0 || kind > 2) return 1;
     const float *edge = params + (ROW_FEATURES+5)*width+4;
     for (int i = 0; i < n; ++i)
     {
@@ -140,20 +141,26 @@ int gnn_student_predict(int n, int cap, int width, int kind, const float *params
             const float *a = hints + 3*k;
             float value = a[0] + omega*a[1];
             float shift = 0.0f;
-            if (kind == 1)
+            if (kind != 0)
             {
                 float z[] = {a[0]/scale, a[1]/scale, a[2]/scale,
                     2.0f*x[5] == coarse_component[col] ? 1.0f : 0.0f,
                     x[1], x[4], x[6]};
                 float e[2];
                 mlp(z, EDGE_FEATURES, width, 2, edge, e);
-                value += a[2];
-                value += scale*clip(e[0], -1.0f, 1.0f)*control[3];
+                if (kind == 2)
+                    value = e[0];
+                else
+                {
+                    value += a[2];
+                    value += scale*clip(e[0], -1.0f, 1.0f)*control[3];
+                }
                 shift = clip(e[1], -1.0f, 1.0f)*control[3];
             }
             if (!isfinite(value) || !isfinite(shift)) return 2;
             weight[j] = value;
-            if (value != 0.0f) score[j] = fabsf(value)/scale + shift;
+            if (value != 0.0f)
+                score[j] = (kind == 2 ? fabsf(value) : fabsf(value)/scale) + shift;
         }
         for (int k = 0; k < budget[i]; ++k)
         {
@@ -164,6 +171,46 @@ int gnn_student_predict(int n, int cap, int width, int kind, const float *params
             if (best < 0) break;
             values[i*cap+best] = weight[best];
             score[best] = -INFINITY;
+        }
+    }
+    return 0;
+}
+
+/* The local graph model ranks edges with an independently supervised score.
+ * It uses the same cutoff and stable tie break during training and inference. */
+int gnn_direct_predict(int n, int cap, int width, int min_entries, int max_entries,
+    float cutoff, const int32_t *markers, const int32_t *columns, const float *features,
+    const float *params, float *values, uint8_t *budget)
+{
+    if (cap < 12 || cap > MAX_CANDIDATES || width < 1 || width > MAX_WIDTH ||
+        min_entries < 1 || max_entries < min_entries || max_entries > cap ||
+        !isfinite(cutoff)) return 1;
+    for (int i = 0; i < n; ++i)
+    {
+        float scores[MAX_CANDIDATES], weights[MAX_CANDIDATES];
+        budget[i] = 0;
+        for (int j = 0; j < cap; ++j)
+        {
+            int k = i*cap+j;
+            values[k] = 0.0f;
+            scores[j] = -INFINITY;
+            if (markers[i] != -1 || columns[k] < 0) continue;
+            float edge[2];
+            mlp(features+k*LOCAL_EDGE_FEATURES, LOCAL_EDGE_FEATURES, width, 2, params, edge);
+            if (!isfinite(edge[0]) || !isfinite(edge[1])) return 2;
+            weights[j] = edge[0];
+            if (edge[0] != 0.0f) scores[j] = edge[1];
+        }
+        for (int k = 0; k < max_entries; ++k)
+        {
+            int best = -1;
+            float top = -INFINITY;
+            for (int j = 0; j < cap; ++j)
+                if (scores[j] > top) { top = scores[j]; best = j; }
+            if (best < 0 || (k >= min_entries && top < cutoff)) break;
+            values[i*cap+best] = weights[best];
+            scores[best] = -INFINITY;
+            ++budget[i];
         }
     }
     return 0;

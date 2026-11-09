@@ -185,6 +185,7 @@ class Hierarchy:
         self.solve = la.lu_solve
         self.direction_samples = None
         self.direction_calls = 0
+        self.direction_sample_calls = (0, 2, 6, 14)
 
     def gain(self, residual):
         a, b = self.first, self.second
@@ -197,7 +198,7 @@ class Hierarchy:
         answer += b.P(correction[lo:hi])
         answer += self.middle.apply(rhs - a.K(answer))
         if self.direction_samples is not None:
-            if self.direction_calls in (0, 2, 6, 14):
+            if self.direction_calls in self.direction_sample_calls:
                 self.direction_samples.append((answer.copy(), correction[lo:hi].copy()))
             self.direction_calls += 1
         return a.P(answer)

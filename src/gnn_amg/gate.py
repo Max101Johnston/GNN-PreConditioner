@@ -99,7 +99,7 @@ def numerical_smoke(config, p, legacy, bridge):
 
 class RetainedFirst:
     """Diagnostic P1 and its matching K1, with verified L3 column identity."""
-    def __init__(self, config, p, legacy, row, teacher):
+    def __init__(self, config, p, legacy, row, teacher, assemble=True):
         from scipy.sparse import csr_matrix
 
         entry = teacher["retained_entry"]
@@ -139,6 +139,30 @@ class RetainedFirst:
         self.native = mapping[0, start:stop].astype(np.int64)
         self.column_scale = mapping[2]
         self.components = (self.native % 3).astype(np.int32)
+        if not assemble:
+            self.receipt = dict(path=str(teacher["retained_export"]),
+                                sha256=digest(teacher["retained_export"]))
+            self.fine_owners = fine_owners
+            self.fine_native = teacher["native"][lo:hi]
+            self.raw_transfer = transfer
+            self.raw_coarse = coarse
+            self.injection_rows = rows
+            self.injection_columns = columns
+            self.markers = np.full(hi-lo, -1, np.int32)
+            empty = np.diff(transfer.indptr) == 0
+            self.markers[empty] = -3
+            self.markers[rows] = 1
+            assert np.all(empty[teacher["fixed"][lo:hi]])
+            assert np.isfinite(transfer.data).all() and np.isfinite(self.cached_second.data).all()
+            terminal_rows = np.flatnonzero(np.isin(self.native, teacher["terminal_native"]))
+            assert np.all(np.diff(self.cached_second.indptr)[terminal_rows] == 1)
+            locations = self.cached_second.indptr[terminal_rows]
+            assert np.all(self.cached_second.data[locations] != 0)
+            terminal_columns = self.cached_second.indices[locations]
+            counts = np.bincount(terminal_columns, minlength=int(self.terminal_owners[-1]))
+            assert np.all(p.reduce(counts) == 1), "L5 injection is not a bijection"
+            assert p.reduce([len(terminal_rows)])[0] == len(teacher["terminal_native"])
+            return
         self.transfer_action = legacy.DistributedSparse(p, transfer, fine_owners, self.owners)
         self.coarse_action = legacy.DistributedSparse(p, coarse, self.owners, self.owners)
         self.coarse = self.coarse_action.matrix
@@ -206,6 +230,44 @@ def checked_hierarchy(config, p, legacy, first, second):
         return None, str(error)
 
 
+def retained_pair(config, p, legacy, bridge, k, pair, components, model, control=None, geometry=None):
+    """Rebuild both Galerkin operators with the original coarse partitions."""
+    from .backend import local_csr
+    from .interpolation import imported_transfer
+    from .student import direct_level
+
+    missing = dict(uncovered_free_rows=0, empty_free_rows=0, injection_error=0.0,
+                   repair_budget_exhausted=0)
+    stats = {}
+    if model is None:
+        stats["level1"] = dict(source="retained_P1", fine_dofs=int(pair.fine_owners[-1]),
+            coarse_dofs=int(pair.owners[-1]), nnz=int(p.reduce([pair.raw_transfer.nnz])[0]), **missing)
+        first = imported_transfer(p, legacy, k, pair.raw_transfer, pair.fine_owners,
+                                  pair.owners, stats["level1"])
+        transfer = pair.cached_second
+    else:
+        first, stats["level1"] = direct_level(config, p, legacy, bridge, k, pair, components, model,
+                                              control, geometry)
+        if first is None:
+            return None, None, stats, "direct_p1_uncovered_rows"
+        # Unit injection changes the C1 coordinates. Rebase P2's rows while
+        # retaining its terminal column scale and identity for this control.
+        lo, hi = pair.owners[p.rank:p.rank+2]
+        transfer = pair.cached_second.multiply(pair.column_scale[lo:hi, None]).tocsr()
+        transfer.sort_indices()
+    fresh, _ = local_csr(p, first.coarse, bridge)
+    stats["k1_nnz"] = int(p.reduce([fresh.nnz])[0])
+    if model is None:
+        delta = fresh - pair.raw_coarse
+        error, norm = p.reduce([delta.data @ delta.data, pair.raw_coarse.data @ pair.raw_coarse.data])
+        stats["retained_k1_relative_error"] = float(np.sqrt(error/max(norm, 1e-300)))
+    stats["level2"] = dict(source="retained_P2", coarse_dofs=int(pair.terminal_owners[-1]),
+        nnz=int(p.reduce([transfer.nnz])[0]), **missing)
+    second = imported_transfer(p, legacy, first.coarse, transfer, pair.owners, pair.terminal_owners,
+                               stats["level2"])
+    return first, second, stats, None
+
+
 def run_method(config, p, replay, legacy, bridge, row, layout, data, method, teacher):
     old = Path(config["baseline_directory"])
     md, rows, full, rhs, initial = data
@@ -227,6 +289,9 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
     shell = callback = None
     stats = {}
     apply_times = []
+    capture = teacher.get("capture_apply") if teacher else None
+    capture_calls = set(config["direct_feedback_calls"]) if capture is not None else set()
+    calls = 0
     failure = None
     if method != "amg":
         lo, hi = map(int, layout["ownership"][p.rank:p.rank+2])
@@ -239,6 +304,14 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
                                    nnz=int(p.reduce([space.t0.cpu.nnz])[0]))
             stats["level2"] = dict(coarse_dofs=space.structure["level_dofs"][2],
                                    nnz=int(p.reduce([space.t1.cpu.nnz])[0]))
+        elif method in ("teacher_roundtrip", "direct_p1"):
+            first, second, stats, failure = retained_pair(config, p, legacy, bridge, k,
+                teacher["pair"], layout["component"], teacher.get("direct_model"), teacher.get("direct_control"),
+                teacher.get("geometry"))
+            if failure is None:
+                space, failure = checked_hierarchy(config, p, legacy, first, second)
+                if stats.get("retained_k1_relative_error", 0) > 1e-9:
+                    failure = "retained_k1_roundtrip"
         elif method == "teacher_cross":
             from .interpolation import imported_transfer
 
@@ -334,7 +407,12 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
                 stats["supervised_files"] = export_state(config, p, bridge, row, layout, teacher, k, first, second)
 
             def action(v, z):
+                nonlocal calls
                 residual = p.array(v)
+                if capture is not None:
+                    if calls in capture_calls:
+                        capture.append(residual.copy())
+                    calls += 1
                 answer = local.apply(residual)
                 answer += space.gain(residual - fine(answer))
                 answer += 0.5 * local.apply(residual - fine(answer))
@@ -344,6 +422,14 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
     replay.setup_solver(p, outer, fs, options)
     setup = p.maximum(time.perf_counter()-start)
     apply_times.clear()
+    if capture is not None:
+        capture.clear()
+        calls = 0
+    export_direct = method == "teacher_roundtrip" and teacher.get("export_direct", False)
+    if export_direct and not failure:
+        space.direction_samples = []
+        if config.get("direct_teacher_kind") == "E":
+            space.direction_sample_calls = tuple(config["direct_sample_calls"])
     if failure:
         result = dict(reached_true_target=False, failure=failure)
     else:
@@ -360,8 +446,25 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
     result.update(method=method, setup_wall_s=setup, numerical=stats,
         displacement_pc_apply_s=p.maximum(sum(apply_times)) if method != "amg" else None,
         displacement_pc_apply_count=len(apply_times) if method != "amg" else None,
-        includes_teacher_loading=False, gnn_inference=False,
+        includes_teacher_loading=False, gnn_inference=method == "direct_p1",
         timing_scope="Gate diagnostic: construction, algebra checks and true-residual monitored solve; not deployment speedup.")
+    if export_direct and result["reached_true_target"]:
+        from .student import export_direct_teacher
+
+        directions = [v[0] for v in space.direction_samples]
+        feedback = teacher.get("feedback_inputs", [])
+        if feedback:
+            space.direction_samples = []
+            space.direction_calls = 0
+            space.direction_sample_calls = tuple(range(len(feedback)))
+            for residual in feedback:
+                space.gain(residual-fine(local.apply(residual)))
+            directions.extend(v[0] for v in space.direction_samples)
+        result["student_teacher"] = export_direct_teacher(config, p, legacy, bridge, row, k,
+            teacher["pair"], layout["component"], directions, teacher["phase"], teacher.get("geometry"),
+            len(feedback))
+    if capture is not None:
+        result["feedback_pc_apply_calls"] = [i for i in sorted(capture_calls) if i < calls]
     p.destroy("KSP", outer)
     if shell is not None:
         p.destroy("PC", shell)
@@ -402,8 +505,8 @@ def load_teacher(config, p, row, layout):
         entry = next(e for e in export["spaces"] if e["label"] == config["baseline_label"])
     elif not config.get("export_supervised"):
         raise FileNotFoundError(export_path)
-    teacher = dict(native=native, depth=depth, terminal_native=native[depth >= 5],
-                   fixed=fixed, retained_entry=entry)
+    teacher = dict(native=native, depth=depth, terminal_native=native[depth >= 5], fixed=fixed,
+                   retained_entry=entry, retained_export=export_path if entry is not None else None)
     return teacher
 
 
