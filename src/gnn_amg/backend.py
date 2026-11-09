@@ -50,9 +50,12 @@ def bind(p, name, args):
     p.functions[name] = fn
 
 
-def ownership(p, matrix):
+def ownership(p, matrix, columns=False):
     lo, hi = p.I(), p.I()
-    p.call("MatGetOwnershipRange", matrix, C.byref(lo), C.byref(hi))
+    name = "MatGetOwnershipRangeColumn" if columns else "MatGetOwnershipRange"
+    if columns:
+        bind(p, name, [p.P, C.POINTER(p.I), C.POINTER(p.I)])
+    p.call(name, matrix, C.byref(lo), C.byref(hi))
     ranges = p.gather_equal([lo.value, hi.value]).astype(np.int64)
     assert np.array_equal(ranges[:-1, 1], ranges[1:, 0])
     return np.r_[ranges[:, 0], ranges[-1, 1]]
@@ -86,7 +89,8 @@ class Action:
 
 
 class Level:
-    def __init__(self, p, bridge, matrix, native, components, selected, constrained, setting):
+    def __init__(self, p, bridge, matrix, native, components, selected, constrained, setting,
+                 form_coarse=True):
         self.p = p
         native = np.asarray(native, dtype=np.int64)
         assert native.shape == components.shape == selected.shape == constrained.shape
@@ -110,7 +114,9 @@ class Level:
         weight = setting.get("weight_option", 0)
         if weight not in (0, 1):
             raise ValueError("Expected ordinary or sign-separated multipass weights")
-        if weight:
+        if not form_coarse:
+            code = bridge.gnn_multipass_build(*args, weight, 0, *suffix)
+        elif weight:
             code = bridge.gnn_multipass_weighted(*args, weight, *suffix)
         else:
             code = bridge.gnn_multipass(*args, *suffix)
@@ -123,9 +129,10 @@ class Level:
         self.executed_markers = cf.copy()
         self.native = native[cf == 1].copy()
         self.components = functions[cf == 1].copy()
-        self.owners = ownership(p, self.coarse)
+        self.owners = ownership(p, self.coarse) if form_coarse else ownership(p, self.transfer, columns=True)
         assert len(self.native) == self.owners[p.rank+1] - self.owners[p.rank]
-        self.P, self.K = Action(p, self.transfer), Action(p, self.coarse)
+        self.P = Action(p, self.transfer) if form_coarse else None
+        self.K = Action(p, self.coarse) if form_coarse else None
         # Every coarse point must inject to exactly its own distributed column.
         lo, hi = ownership(p, matrix)[p.rank:p.rank+2]
         offset = int(self.owners[p.rank])
@@ -144,8 +151,9 @@ class Level:
         self.stats["injection_error"] = p.maximum(largest)
 
     def close(self):
-        self.P.close()
-        self.K.close()
+        if self.K is not None:
+            self.P.close()
+            self.K.close()
         self.p.destroy("Mat", self.transfer, self.coarse)
 
 
@@ -213,6 +221,12 @@ def load_bridge(p, path):
         args = bridge.gnn_multipass.argtypes
         bridge.gnn_multipass_weighted.argtypes = args[:6] + [p.I] + args[6:]
         bridge.gnn_multipass_weighted.restype = p.I
+    if hasattr(bridge, "gnn_multipass_build"):
+        args = bridge.gnn_multipass.argtypes
+        bridge.gnn_multipass_build.argtypes = args[:6] + [p.I, p.I] + args[6:]
+        bridge.gnn_multipass_build.restype = p.I
+        bridge.gnn_abs_row_sums.argtypes = [p.P, p.P]
+        bridge.gnn_abs_row_sums.restype = p.I
     if hasattr(bridge, "gnn_copy_csr"):
         bridge.gnn_copy_csr.argtypes = [p.P, p.P, p.P, p.P]
         bridge.gnn_copy_csr.restype = p.I
@@ -249,20 +263,26 @@ def local_csr(p, matrix, bridge=None):
                        np.asarray(indptr, dtype=np.int32)), shape=(hi-lo, width.value)), owners
 
 
-def graph_features(p, bridge, matrix, components, attributes, constrained, stage, support, strength=0.25):
-    """Observable physical and numerical inputs; no teacher information."""
+def strength_graph(p, bridge, matrix, components, strength, algebra=None):
     graph = p.P()
     functions = np.ascontiguousarray(components, dtype=np.int32)
-    algebra = np.empty((len(functions), 8), dtype=np.float64)
     bridge.gnn_graph.argtypes = [p.P, p.P, p.D, C.POINTER(p.P), p.P]
     bridge.gnn_graph.restype = p.I
-    code = bridge.gnn_graph(matrix, functions.ctypes.data, strength, C.byref(graph), algebra.ctypes.data)
+    data = None if algebra is None else algebra.ctypes.data
+    code = bridge.gnn_graph(matrix, functions.ctypes.data, strength, C.byref(graph), data)
     if code:
         raise RuntimeError("Graph export error %d" % code)
     adjacency, owners = local_csr(p, graph, bridge)
     p.destroy("Mat", graph)
+    return adjacency, owners
+
+
+def graph_features(p, bridge, matrix, components, attributes, constrained, stage, support, strength=0.25):
+    """Observable physical and numerical inputs; no teacher information."""
+    algebra = np.empty((len(components), 8), dtype=np.float64)
+    adjacency, owners = strength_graph(p, bridge, matrix, components, strength, algebra)
     features = np.column_stack([attributes, algebra, np.eye(3)[components],
-        constrained.astype(float), np.full(len(functions), stage), np.log1p(support)]).astype(np.float32)
+        constrained.astype(float), np.full(len(components), stage), np.log1p(support)]).astype(np.float32)
     assert np.isfinite(features).all() and np.isfinite(adjacency.data).all()
     sums = np.asarray(adjacency.sum(axis=1)).ravel()
     assert np.allclose(sums[np.diff(adjacency.indptr) > 0], 1)

@@ -5,7 +5,7 @@ import numpy as np
 from scipy import sparse
 from scipy.sparse.csgraph import dijkstra
 
-from .backend import Action, Level, bind, graph_features, local_csr
+from .backend import Action, Level, bind, graph_features, local_csr, ownership
 from .dataset import gather_array, gather_graph
 from .inference import graph_decode
 
@@ -223,6 +223,13 @@ def harmonic_level(config, p, legacy, bridge, first, selected, entries, broadcas
     if "error" in meta or meta["empty_free_rows"]:
         return None, meta, "harmonic_factorization_or_coverage"
 
+    level = distribute_p2(p, legacy, first.coarse, transfer, rows, owners, meta)
+    level.executed_markers = np.where(selected, 1, -1).astype(np.int8)
+    return level, meta, None
+
+
+def distribute_p2(p, legacy, matrix, transfer, rows, owners, meta):
+    n, nc = int(rows[-1]), int(owners[-1])
     # The coarse matrix is small and sparse. Broadcast typed CSR buffers.
     mpi_byte = p.P(C.addressof((C.c_char*1).in_dll(p.mpi, "ompi_mpi_byte")))
     buffers = []
@@ -234,15 +241,21 @@ def harmonic_level(config, p, legacy, bridge, first, selected, entries, broadcas
         buffers.append(buf)
     transfer = sparse.csr_matrix((buffers[2], buffers[1], buffers[0]), shape=(n, nc))
     lo, hi = rows[p.rank:p.rank+2]
-    level = imported_transfer(p, legacy, first.coarse, transfer[lo:hi], rows, owners, meta)
-    level.executed_markers = np.where(selected, 1, -1).astype(np.int8)
-    return level, meta, None
+    return imported_transfer(p, legacy, matrix, transfer[lo:hi], rows, owners, meta)
 
 
-def enrich_first(p, legacy, bridge, matrix, first, sweeps, row_budget):
+def enrich_first(p, legacy, bridge, matrix, first, sweeps, row_budget, native_scaling=False):
     """Expand support by actual stiffness coupling, with bounded signed weights."""
-    stiffness, rows = local_csr(p, matrix, bridge)
-    scale = 1/np.maximum(np.asarray(abs(stiffness).sum(axis=1)).ravel(), 1e-30)
+    if native_scaling:
+        rows = ownership(p, matrix)
+        sums = np.empty(rows[p.rank+1]-rows[p.rank], dtype=np.float64)
+        code = bridge.gnn_abs_row_sums(matrix, sums.ctypes.data)
+        if code:
+            raise RuntimeError("Native absolute row sums failed: %d" % code)
+    else:
+        stiffness, rows = local_csr(p, matrix, bridge)
+        sums = np.asarray(abs(stiffness).sum(axis=1)).ravel()
+    scale = 1/np.maximum(sums, 1e-30)
     original, _ = local_csr(p, first.transfer, bridge)
     protected = first.executed_markers != -1
     scale[protected] = 0.0
@@ -283,3 +296,100 @@ def enrich_first(p, legacy, bridge, matrix, first, sweeps, row_budget):
     level.native, level.components = first.native, first.components
     level.executed_markers = first.executed_markers
     return level
+
+
+def compare_transfers(p, reference, candidate):
+    """Compare owned sparse rows outside the timed construction and solve."""
+    result = {}
+    for name in ("P1", "K1", "P2"):
+        a, b = reference.get(name), candidate.get(name)
+        if p.maximum(int(a is None or b is None or a.shape != b.shape)):
+            result[name] = dict(comparable=False)
+            continue
+        pattern = np.array_equal(a.indptr, b.indptr) and np.array_equal(a.indices, b.indices)
+        diff = a-b
+        diff2, ref2 = p.reduce([diff.data@diff.data, a.data@a.data])
+        result[name] = dict(comparable=True, same_pattern=not bool(p.maximum(int(not pattern))),
+            relative_frobenius=float(np.sqrt(diff2/max(ref2, 1e-300))))
+    return result
+
+
+def optimize_supported_weights(matrix, transfer, markers, expansion_budget=0):
+    """Two signed least-squares steps with fixed injection and chosen support."""
+    coarse = np.flatnonzero(markers == 1)
+    fine = np.flatnonzero(markers != 1)
+    a = matrix[fine][:, fine].tocsr()
+    rhs = matrix[fine][:, coarse].tocsr()
+    scale = 1/np.maximum(np.asarray(abs(matrix[fine]).sum(axis=1)).ravel(), 1e-30)
+    a = a.multiply(scale[:, None]).tocsr()
+    rhs = rhs.multiply(scale[:, None]).tocsr()
+    weights = transfer[fine].copy()
+    weights.eliminate_zeros()
+    support = weights.astype(bool)
+    residual = a @ weights + rhs
+    reference = max(float(np.linalg.norm(rhs.data)), 1e-30)
+    initial = float(np.linalg.norm(residual.data))/reference
+    if expansion_budget:
+        # Add the largest missing entries from one actual stiffness residual.
+        # Starting weights and the subsequent optimizer are the same in both runs.
+        missing = (residual - residual.multiply(support)).tocsr()
+        missing.eliminate_zeros()
+        new_rows, new_cols = [], []
+        for row in np.flatnonzero(markers[fine] == -1):
+            slots = expansion_budget-(support.indptr[row+1]-support.indptr[row])
+            if slots <= 0:
+                continue
+            lo, hi = missing.indptr[row:row+2]
+            choose = np.argsort(-np.abs(missing.data[lo:hi]), kind="stable")[:slots]
+            new_rows.extend([row]*len(choose))
+            new_cols.extend(missing.indices[lo+choose])
+        extra = sparse.csr_matrix((np.ones(len(new_rows), bool), (new_rows, new_cols)), shape=weights.shape)
+        support = support.maximum(extra)
+    for _ in range(2):
+        gradient = (a.T @ residual).multiply(support).tocsr()
+        direction = a @ gradient
+        numer = np.asarray(gradient.power(2).sum(axis=0)).ravel()
+        denom = np.asarray(direction.power(2).sum(axis=0)).ravel()
+        step = np.divide(numer, denom, out=np.zeros_like(numer), where=denom > 0)
+        weights = (weights - gradient.multiply(step)).tocsr()
+        residual = a @ weights + rhs
+    refined = float(np.linalg.norm(residual.data))/reference
+    if not np.isfinite(refined) or refined > initial + 1e-12:
+        raise ValueError("P2 weight optimization increased its residual")
+    weights.eliminate_zeros()
+    w = weights.tocoo()
+    answer = sparse.csr_matrix((np.r_[w.data, np.ones(len(coarse))],
+        (np.r_[fine[w.row], coarse], np.r_[w.col, np.arange(len(coarse))])),
+        shape=transfer.shape)
+    degree = np.diff(answer.indptr)
+    if np.any((markers == -1) & (degree == 0)) or np.any((markers == -3) & (degree != 0)):
+        raise ValueError("P2 weight optimization changed protected rows or coverage")
+    if not np.isfinite(answer.data).all():
+        raise ValueError("P2 weight optimization produced non-finite entries")
+    return answer, dict(support_budget=expansion_budget, weight_sweeps=2,
+                        original_nnz=int(transfer.nnz), candidate_nnz=int(support.nnz)+len(coarse),
+                        maximum_fine_row_entries=int(degree[fine].max()),
+                        initial_relative_residual=initial, refined_relative_residual=refined)
+
+
+def refine_second(p, legacy, bridge, first, initial, expansion_budget, broadcast_json):
+    rows, ki, kj, kv = collect_csr(p, bridge, first.coarse)
+    _, pi, pj, pv = collect_csr(p, bridge, initial.transfer)
+    markers = gather_array(p, initial.executed_markers, rows)
+    transfer, meta = None, None
+    if p.rank == 0:
+        try:
+            n, nc = int(rows[-1]), int(initial.owners[-1])
+            k1 = sparse.csr_matrix((kv, kj, ki), shape=(n, n))
+            p2 = sparse.csr_matrix((pv, pj, pi), shape=(n, nc))
+            transfer, meta = optimize_supported_weights(k1, p2, markers, expansion_budget)
+            meta = dict(initial.stats, **meta)
+            meta["nnz"] = int(transfer.nnz)
+        except ValueError as error:
+            meta = dict(initial.stats, error=str(error))
+    meta = broadcast_json(p, meta)
+    if "error" in meta:
+        return None, meta
+    result = distribute_p2(p, legacy, first.coarse, transfer, rows, initial.owners, meta)
+    result.executed_markers = initial.executed_markers
+    return result, meta

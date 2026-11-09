@@ -5,6 +5,7 @@ pickled objects. A job-private token authenticates the sole MPI-root client.
 """
 import argparse
 import ctypes as C
+from functools import lru_cache
 import itertools
 import json
 import os
@@ -144,6 +145,12 @@ def spatial_decode(scores, features, native, eligible, indptr, indices, fraction
 
 
 
+def connection_prior(indices, weights, size):
+    incoming = np.bincount(indices, weights=weights, minlength=size)
+    return np.clip(np.log1p(incoming)-np.log(2), -2, 2).astype(np.float32)
+
+
+@lru_cache(maxsize=4)
 def load_selector(path):
     library = C.CDLL(str(path))
     select = library.gnn_select
@@ -575,8 +582,7 @@ def serve(config, endpoint):
                 raise ValueError("Invalid stage")
             features = arrays["features"]
             n = len(features)
-            incoming = np.bincount(arrays["indices"], weights=arrays["weights"], minlength=n)
-            prior = np.clip(np.log1p(incoming)-np.log(2), -2, 2).astype(np.float32)
+            prior = connection_prior(arrays["indices"], arrays["weights"], n)
             prior_seconds = time.perf_counter() - begin
             network_seconds = normalization_seconds = 0.0
             if request.get("neutral", False):

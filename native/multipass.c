@@ -168,8 +168,9 @@ static int uncovered(hypre_ParCSRMatrix *s, int *cf, const int64_t *native,
  * added C points, repair rounds, exhausted-repair-budget flag.
  * The caller supplies actual component IDs; coarse IDs are NOT index modulo 3.
  * Constrained rows use -3 and are handled by the unchanged fine smoother. */
-PetscErrorCode gnn_multipass_weighted(Mat a, int *markers, const int *functions,
+PetscErrorCode gnn_multipass_build(Mat a, int *markers, const int *functions,
                             double strength, double truncation, int max_entries, int weight_option,
+                            int form_coarse,
                             const int64_t *native, int max_repairs, int *flags,
                             Mat *p, Mat *coarse, long long stats[11])
 {
@@ -232,7 +233,7 @@ PetscErrorCode gnn_multipass_weighted(Mat a, int *markers, const int *functions,
     TRY(MPI_Allreduce(local_stats, total, 3, MPI_LONG_LONG, MPI_SUM, hypre_ParCSRMatrixComm(h)));
     stats[3] = total[0]; stats[4] = total[1];
     if (total[2]) { err = 72; goto cleanup; }
-    TRY(MatPtAP(a, *p, MAT_INITIAL_MATRIX, PETSC_DEFAULT, coarse));
+    if (form_coarse) { TRY(MatPtAP(a, *p, MAT_INITIAL_MATRIX, PETSC_DEFAULT, coarse)); }
 cleanup:
     if (hp) hypre_ParCSRMatrixDestroy(hp);
     if (s) hypre_ParCSRMatrixDestroy(s);
@@ -301,16 +302,19 @@ PetscErrorCode gnn_graph(Mat a, const int *functions, double strength,
             hypre_CSRMatrixData(sd)[j] = lookup_d[hypre_CSRMatrixJ(sd)[j]] / fmax(strong, 1e-300);
         for (int j = hypre_CSRMatrixI(so)[i]; j < hypre_CSRMatrixI(so)[i+1]; ++j)
             hypre_CSRMatrixData(so)[j] = lookup_o[hypre_CSRMatrixJ(so)[j]] / fmax(strong, 1e-300);
-        int off = hypre_CSRMatrixI(so)[i+1] - hypre_CSRMatrixI(so)[i];
-        int degree = off + hypre_CSRMatrixI(sd)[i+1] - hypre_CSRMatrixI(sd)[i];
-        features[8*i] = log10(fmax(fabs(diagonal), 1e-30));
-        features[8*i+1] = log10(fmax(total, 1e-30));
-        features[8*i+2] = negative / fmax(total, 1e-300);
-        features[8*i+3] = positive / fmax(total, 1e-300);
-        features[8*i+4] = log1p(degree);
-        features[8*i+5] = ((double)off) / (degree ? degree : 1);
-        features[8*i+6] = diagonal / fmax(total, 1e-300);
-        features[8*i+7] = diagonal > 0 ? 1 : (diagonal < 0 ? -1 : 0);
+        if (features)
+        {
+            int off = hypre_CSRMatrixI(so)[i+1] - hypre_CSRMatrixI(so)[i];
+            int degree = off + hypre_CSRMatrixI(sd)[i+1] - hypre_CSRMatrixI(sd)[i];
+            features[8*i] = log10(fmax(fabs(diagonal), 1e-30));
+            features[8*i+1] = log10(fmax(total, 1e-30));
+            features[8*i+2] = negative / fmax(total, 1e-300);
+            features[8*i+3] = positive / fmax(total, 1e-300);
+            features[8*i+4] = log1p(degree);
+            features[8*i+5] = ((double)off) / (degree ? degree : 1);
+            features[8*i+6] = diagonal / fmax(total, 1e-300);
+            features[8*i+7] = diagonal > 0 ? 1 : (diagonal < 0 ? -1 : 0);
+        }
     }
     GRAPH_TRY(import_parcsr(s, graph));
 cleanup:
@@ -320,6 +324,15 @@ cleanup:
     if (err && *graph) MatDestroy(graph);
     return err;
 #undef GRAPH_TRY
+}
+
+PetscErrorCode gnn_multipass_weighted(Mat a, int *markers, const int *functions,
+                            double strength, double truncation, int max_entries, int weight_option,
+                            const int64_t *native, int max_repairs, int *flags,
+                            Mat *p, Mat *coarse, long long stats[11])
+{
+    return gnn_multipass_build(a, markers, functions, strength, truncation,
+        max_entries, weight_option, 1, native, max_repairs, flags, p, coarse, stats);
 }
 
 PetscErrorCode gnn_multipass(Mat a, int *markers, const int *functions,
@@ -356,6 +369,50 @@ PetscErrorCode gnn_copy_csr(Mat a, int *offsets, int *columns, double *values)
         pos += count;
         offsets[i-lo+1] = pos;
         ierr = MatRestoreRow(a, i, &count, &cols, &vals);CHKERRQ(ierr);
+    }
+    return 0;
+}
+
+/* The reference uses float64 CSR reduceat: it starts with the first entry
+ * and adds the pairwise reduction of the rest. Preserve its reduction order
+ * because a rounding change can break a tie at the sparse row budget. */
+static double abs_pairwise_sum(const PetscScalar *v, PetscInt count)
+{
+    if (count > 128)
+    {
+        PetscInt split = (count / 16) * 8;
+        return abs_pairwise_sum(v, split) + abs_pairwise_sum(v + split, count - split);
+    }
+    double sum = 0.0;
+    PetscInt index = 0;
+    if (count >= 8)
+    {
+        double lane[8];
+        for (int i = 0; i < 8; ++i) lane[i] = fabs(v[i]);
+        PetscInt bulk = count - count % 8;
+        for (index = 8; index < bulk; index += 8)
+            for (int i = 0; i < 8; ++i) lane[i] += fabs(v[index+i]);
+        for (int step = 1; step < 8; step *= 2)
+            for (int i = 0; i < 8; i += 2*step) lane[i] += lane[i+step];
+        sum = lane[0];
+    }
+    for (; index < count; ++index) sum += fabs(v[index]);
+    return sum;
+}
+
+/* Local row scales without exporting the stiffness matrix. */
+PetscErrorCode gnn_abs_row_sums(Mat a, double *sums)
+{
+    PetscInt lo, hi;
+    PetscErrorCode ierr = MatGetOwnershipRange(a, &lo, &hi);CHKERRQ(ierr);
+    for (PetscInt row = lo; row < hi; ++row)
+    {
+        PetscInt count;
+        const PetscInt *columns;
+        const PetscScalar *values;
+        ierr = MatGetRow(a, row, &count, &columns, &values);CHKERRQ(ierr);
+        sums[row-lo] = count ? fabs(values[0]) + abs_pairwise_sum(values+1, count-1) : 0.0;
+        ierr = MatRestoreRow(a, row, &count, &columns, &values);CHKERRQ(ierr);
     }
     return 0;
 }

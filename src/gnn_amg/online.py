@@ -14,9 +14,9 @@ import time
 import numpy as np
 
 from .backend import (Action, Hierarchy, Level, digest, graph_features, load_bridge,
-    load_dependencies, pooled_attributes, read_json, record, solve_with_deadline)
+    load_dependencies, local_csr, pooled_attributes, read_json, record, solve_with_deadline, strength_graph)
 from .dataset import gather_array, gather_graph, physical_attributes
-from .inference import PolicyClient
+from .inference import PolicyClient, connection_prior, graph_decode, load_selector
 
 
 def broadcast_selection(p, selected, count):
@@ -31,19 +31,33 @@ def broadcast_selection(p, selected, count):
 
 def choose(config, p, bridge, rpc, matrix, native, comp, attributes, fixed, mass, stage, neutral, context=None):
     start = time.perf_counter()
-    x, graph, owners = graph_features(p, bridge, matrix, comp, attributes, fixed, stage, mass,
-        config["interpolation"]["strength_threshold"])
+    fast = (context or {}).get("fast_prior", False)
+    strength = config["interpolation"]["strength_threshold"]
+    if fast:
+        graph, owners = strength_graph(p, bridge, matrix, comp, strength)
+    else:
+        x, graph, owners = graph_features(p, bridge, matrix, comp, attributes, fixed, stage, mass, strength)
     local_features_end = time.perf_counter()
     buffers = gather_graph(p, graph, owners)
-    arrays = dict(features=gather_array(p, x, owners).astype(np.float32),
-        native=gather_array(p, native, owners).astype(np.int64),
-        eligible=gather_array(p, ~fixed, owners).astype(bool))
+    arrays = dict(native=gather_array(p, native, owners), eligible=gather_array(p, ~fixed, owners))
+    if not fast:
+        arrays["features"] = gather_array(p, x, owners)
     gather_end = time.perf_counter()
     selected, reply = None, {}
     if p.rank == 0:
         arrays.update(buffers)
-        reply, response = rpc.request(dict(operation="select", stage=stage, neutral=neutral, **(context or {})), arrays)
-        selected = response["selected"]
+        if fast:
+            begin = time.perf_counter()
+            scores = connection_prior(arrays["indices"], arrays["weights"], len(arrays["native"]))
+            selector = load_selector(config["selector"]) if "selector" in config else None
+            selected, decoder = graph_decode(scores, arrays["native"], arrays["eligible"],
+                arrays["indptr"], arrays["indices"], config["decoder"]["radii"][stage], selector=selector)
+            reply = dict(policy="prior_only", decoder=decoder, device="cpu",
+                         network_with_copies_s=0.0, checkpoint_sha256=None,
+                         service_compute_s=time.perf_counter()-begin)
+        else:
+            reply, response = rpc.request(dict(operation="select", stage=stage, neutral=neutral, **(context or {})), arrays)
+            selected = response["selected"]
         assert selected.dtype == bool and selected.shape == (int(owners[-1]),)
         assert not np.any(selected & ~arrays["eligible"])
     global_selection = broadcast_selection(p, selected, int(owners[-1]))
@@ -56,7 +70,8 @@ def choose(config, p, bridge, rpc, matrix, native, comp, attributes, fixed, mass
     return global_selection[lo:hi].copy(), timing
 
 
-def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data, neutral=False, context=None):
+def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
+                 neutral=False, context=None, capture=None):
     md, rows, full, rhs, initial = data
     solution = p.vector(full)
     if md["configuration"]["initial_guess_nonzero"]:
@@ -77,22 +92,30 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     comp = layout["component"][lo:hi].astype(np.int32)
     fixed = fields["constrained"][native]
     local = legacy.LocalPC(p, k, Path(config["baseline_directory"]) / "cache" / row["case"], lo, hi, "ras")
-    attributes = physical_attributes(fields, layout["xyz"], native)
+    fast = (context or {}).get("fast_prior", False)
+    if fast and (neutral or context.get("policy") != "prior_only" or context.get("training")
+                 or config["decoder"]["kind"] != "directed_graph"):
+        raise ValueError("The fast path requires deterministic directed-graph prior selection")
+    attributes = None if fast else physical_attributes(fields, layout["xyz"], native)
     first = second = space = shell = callback = None
     numerical, timings, failure = {}, {}, None
     proposed_first, timings["first_decision"] = choose(config, p, bridge, rpc, k, native, comp,
-        attributes, fixed, np.ones(len(native)), 0, neutral, context)
-    first = Level(p, bridge, k, native, comp, proposed_first, fixed, config["interpolation"])
+        attributes, fixed, None if fast else np.ones(len(native)), 0, neutral, context)
+    sweeps = (context or {}).get("p1_refinement_sweeps", 0)
+    initial_start = time.perf_counter()
+    first = Level(p, bridge, k, native, comp, proposed_first, fixed, config["interpolation"],
+                  form_coarse=not (fast and sweeps))
+    numerical["p1_initial_s"] = p.maximum(time.perf_counter()-initial_start)
     numerical["level1"] = first.stats
     if first.stats["uncovered_free_rows"] or first.stats["empty_free_rows"] or first.stats["injection_error"] or first.stats["repair_budget_exhausted"]:
         failure = "first_interpolation_coverage_or_injection"
-    sweeps = (context or {}).get("p1_refinement_sweeps", 0)
     if sweeps and failure is None:
         from .interpolation import enrich_first
 
         refine_start = time.perf_counter()
         try:
-            refined = enrich_first(p, legacy, bridge, k, first, sweeps, config["p1_refinement_row_budget"])
+            refined = enrich_first(p, legacy, bridge, k, first, sweeps,
+                                   config["p1_refinement_row_budget"], native_scaling=fast)
         except ValueError as error:
             failure = str(error)
         else:
@@ -102,7 +125,7 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
         numerical["p1_refinement_s"] = p.maximum(time.perf_counter()-refine_start)
     proposed_second = None
     if failure is None:
-        pooled, mass = pooled_attributes(p, first, attributes, bridge)
+        pooled, mass = (None, None) if fast else pooled_attributes(p, first, attributes, bridge)
         proposed_second, timings["second_decision"] = choose(config, p, bridge, rpc, first.coarse,
             first.native, first.components, pooled, np.zeros(len(first.native), bool), mass, 1, neutral, context)
         builder = (context or {}).get("p2_builder", "direct")
@@ -118,10 +141,28 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
             second, numerical["level2"], failure = harmonic_level(
                 config, p, legacy, bridge, first, proposed_second,
                 context["p2_entries"], broadcast_json)
-        elif builder == "direct":
+        elif builder in ("direct", "weights"):
+            setting = dict(config["interpolation"], max_coarse_dofs=config["terminal_max_dofs"])
+            if builder == "weights":
+                setting["coverage_repair_fraction"] = 0.0
             second = Level(p, bridge, first.coarse, first.native, first.components, proposed_second,
-                np.zeros(len(first.native), bool), dict(config["interpolation"], max_coarse_dofs=config["terminal_max_dofs"]))
+                np.zeros(len(first.native), bool), setting, form_coarse=builder == "direct")
             numerical["level2"] = second.stats
+            if builder == "weights":
+                from .interpolation import refine_second
+
+                original = second
+                second = None
+                bad = any(original.stats[k] for k in ("uncovered_free_rows", "empty_free_rows",
+                                                       "injection_error", "repair_budget_exhausted"))
+                if bad or original.owners[-1] > config["terminal_max_dofs"]:
+                    failure = "p2_weight_seed_failed"
+                else:
+                    second, numerical["level2"] = refine_second(p, legacy, bridge, first, original,
+                        context["p2_expand_budget"], broadcast_json)
+                    if second is None:
+                        failure = "p2_weight_optimization_failed"
+                original.close()
         else:
             raise ValueError("Unknown P2 builder: " + builder)
         if second is None:
@@ -177,6 +218,12 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
         checkpoint_scope="Initial checkpoint; policy_update identifies subsequent on-policy updates"
             if (context or {}).get("training") else "Frozen inference checkpoint",
         timing_scope="Fresh physical/algebraic features,2decisionpolicy/RPC path,repair,preconditioner construction and complete true-residual-monitored solve. Algebra audits included. Replay input loading and artifact logging excluded for all methods.")
+    if capture is not None and result["reached_true_target"]:
+        for name, matrix in (("P1", first.transfer), ("K1", first.coarse), ("P2", second.transfer)):
+            values, _ = local_csr(p, matrix, bridge)
+            values.eliminate_zeros()
+            values.sort_indices()
+            capture[name] = values
     # Archive raw/executed choices after the measured numerical work.
     arrays = dict(native=gather_array(p, native, layout["ownership"]).astype(np.int64),
         raw_first=gather_array(p, proposed_first, layout["ownership"]).astype(bool),
@@ -507,6 +554,7 @@ def review(config, p, replay, legacy, bridge, rpc, inventory):
         p.destroy("Mat", data[2])
 
     if validation:
+        fast_comparison = config.get("interpolation_fast_validation", False)
         results = []
         for index, key in enumerate(keys):
             if index % workers != p.worker:
@@ -515,19 +563,31 @@ def review(config, p, replay, legacy, bridge, rpc, inventory):
             layout, fields, data = load_observed_state(config, p, replay, row)
             # The frozen parameters come from training-only comparisons.
             # Alternate order within a frame to reduce timing-order effects.
-            paired = [("prior_only", 0), ("prior_p1_twice", 2)]
+            paired = ([("p1_reference", 2), ("p1_fast", 2)] if fast_comparison
+                      else [("prior_only", 0), ("prior_p1_twice", 2)])
             if index % 2:
                 paired.reverse()
+            matrices, pair = {}, {}
             for label, sweeps in paired:
-                result = solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
-                    context=dict(policy="prior_only", tag=label, p1_refinement_sweeps=sweeps))
+                capture = {} if fast_comparison else None
+                pair[label] = solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
+                    context=dict(policy="prior_only", tag=label, p1_refinement_sweeps=sweeps,
+                                 fast_prior=label == "p1_fast"), capture=capture)
+                matrices[label] = capture
+            if fast_comparison:
+                from .interpolation import compare_transfers
+
+                pair["p1_fast"]["matrix_comparison"] = compare_transfers(
+                    p, matrices["p1_reference"], matrices["p1_fast"])
+            for label, result in pair.items():
                 results.append(save(result, row, label))
-            prefix = config["retained_export_prefixes"]["validation"]
-            export = read_json(old / "records" / ("solver-export-"+prefix+"-"+key+".json"))
-            teacher = dict(retained_entry=next(e for e in export["spaces"] if e["label"] == config["baseline_label"]))
-            for label in ("retained_base", "amg"):
-                result = run_method(config, p, replay, legacy, bridge, row, layout, data, label, teacher)
-                results.append(save(result, row, label))
+            if not fast_comparison:
+                prefix = config["retained_export_prefixes"]["validation"]
+                export = read_json(old / "records" / ("solver-export-"+prefix+"-"+key+".json"))
+                teacher = dict(retained_entry=next(e for e in export["spaces"] if e["label"] == config["baseline_label"]))
+                for label in ("retained_base", "amg"):
+                    result = run_method(config, p, replay, legacy, bridge, row, layout, data, label, teacher)
+                    results.append(save(result, row, label))
             destroy(data)
         if p.rank == 0:
             rpc.close()
@@ -536,9 +596,9 @@ def review(config, p, replay, legacy, bridge, rpc, inventory):
             path = output / "records" / ("review-%s.json" % job)
             with path.open("x") as stream:
                 json.dump(dict(job=job, split=split, workers=pieces), stream, allow_nan=False, indent=2)
-        controls = [r for item in pieces for r in item["results"]
-                    if r["label"] in ("prior_only", "retained_base", "amg")]
-        return 0 if len(controls) == 3*len(keys) and all(r["reached_true_target"] for r in controls) else 2
+        labels = ("p1_reference", "p1_fast") if fast_comparison else ("prior_only", "retained_base", "amg")
+        controls = [r for item in pieces for r in item["results"] if r["label"] in labels]
+        return 0 if len(controls) == len(labels)*len(keys) and all(r["reached_true_target"] for r in controls) else 2
 
     parity = None
     if not config.get("interpolation_review"):
@@ -593,6 +653,11 @@ def review(config, p, replay, legacy, bridge, rpc, inventory):
         else:
             context = dict(policy=name, tag=name,
                            export_p2_sample=name in config.get("export_p2_samples", []))
+            if name in config.get("p2_weight_variants", {}):
+                context.update(policy="prior_only", p2_builder="weights",
+                               p2_expand_budget=config["p2_weight_variants"][name])
+            if name in config.get("fast_prior_methods", []):
+                context.update(policy="prior_only", fast_prior=True)
             if name in config.get("p2_staged_variants", {}):
                 context.update(policy="prior_only", p2_builder="staged",
                                p2_radius=config["p2_staged_variants"][name])
