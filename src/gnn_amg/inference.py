@@ -4,6 +4,7 @@ The wire format is JSON metadata followed by typed numeric buffers, never
 pickled objects. A job-private token authenticates the sole MPI-root client.
 """
 import argparse
+import ctypes as C
 import itertools
 import json
 import os
@@ -14,6 +15,7 @@ import struct
 import time
 
 import numpy as np
+from scipy import sparse
 
 from .backend import digest, read_json, record
 
@@ -66,8 +68,15 @@ def receive_packet(stream):
 
 
 class PolicyClient:
-    def __init__(self, endpoint):
+    def __init__(self, endpoint, colocated=False):
         cfg = read_json(endpoint)
+        self.binding = None
+        if colocated:
+            host = socket.gethostname()
+            cpus = sorted(os.sched_getaffinity(0))
+            if cfg["node"] != host or cfg["cpus"] != cpus or cfg["host"] != "127.0.0.1":
+                raise RuntimeError("Policy service must share the actual solver root's host and affinity")
+            self.binding = dict(node=host, cpus=cpus, service_pid=cfg["pid"])
         self.stream = socket.create_connection((cfg["host"], cfg["port"]), timeout=300)
         self.request(dict(operation="hello", token=cfg["token"]))
 
@@ -135,7 +144,15 @@ def spatial_decode(scores, features, native, eligible, indptr, indices, fraction
 
 
 
-def graph_decode(scores, native, eligible, indptr, indices, radius):
+def load_selector(path):
+    library = C.CDLL(str(path))
+    select = library.gnn_select
+    select.argtypes = [C.c_int, C.c_int] + [C.c_void_p]*4 + [C.c_int] + [C.c_void_p]*2
+    select.restype = C.c_int
+    return select
+
+
+def graph_decode(scores, native, eligible, indptr, indices, radius, selector=None):
     """One score ordering, followed by directed strong-path exclusion.
 
     A selected DOF suppresses only rows that can reach it along at most
@@ -145,7 +162,6 @@ def graph_decode(scores, native, eligible, indptr, indices, radius):
     Native IDs resolve score ties independently of MPI ownership/order.
     The radius is frozen before RL; the number of selected DOFs is an output.
     """
-    from scipy import sparse
     scores = np.asarray(scores)
     native = np.asarray(native, dtype=np.int64)
     eligible = np.asarray(eligible, dtype=bool)
@@ -162,24 +178,35 @@ def graph_decode(scores, native, eligible, indptr, indices, radius):
     order = candidates[np.lexsort((native[candidates], -scores[candidates]))]
     distance = np.full(n, radius+1, np.int8)
     selected = np.zeros(n, bool)
-    for root in order:
-        if distance[root] <= radius:
-            continue
-        selected[root] = True
-        distance[root] = 0
-        frontier = np.asarray([root], dtype=np.int64)
-        for depth in range(1, radius+1):
-            starts = incoming.indptr[frontier]
-            lengths = incoming.indptr[frontier+1] - starts
-            offsets = np.r_[0, np.cumsum(lengths)]
-            if offsets[-1] == 0:
-                break
-            positions = np.repeat(starts-offsets[:-1], lengths) + np.arange(offsets[-1])
-            parents = incoming.indices[positions]
-            frontier = np.unique(parents[eligible[parents] & (distance[parents] > depth)])
-            if len(frontier) == 0:
-                break
-            distance[frontier] = depth
+    if selector is not None:
+        order32 = np.ascontiguousarray(order, dtype=np.int32)
+        active = np.ascontiguousarray(eligible)
+        offsets = np.ascontiguousarray(incoming.indptr, dtype=np.int32)
+        rows = np.ascontiguousarray(incoming.indices, dtype=np.int32)
+        code = selector(n, len(order), order32.ctypes.data, active.ctypes.data,
+                        offsets.ctypes.data, rows.ctypes.data, radius,
+                        distance.ctypes.data, selected.ctypes.data)
+        if code:
+            raise MemoryError("Native selection queue allocation failed")
+    else:
+        for root in order:
+            if distance[root] <= radius:
+                continue
+            selected[root] = True
+            distance[root] = 0
+            frontier = np.asarray([root], dtype=np.int64)
+            for depth in range(1, radius+1):
+                starts = incoming.indptr[frontier]
+                lengths = incoming.indptr[frontier+1] - starts
+                offsets = np.r_[0, np.cumsum(lengths)]
+                if offsets[-1] == 0:
+                    break
+                positions = np.repeat(starts-offsets[:-1], lengths) + np.arange(offsets[-1])
+                parents = incoming.indices[positions]
+                frontier = np.unique(parents[eligible[parents] & (distance[parents] > depth)])
+                if len(frontier) == 0:
+                    break
+                distance[frontier] = depth
     if len(candidates) and (not selected.any() or np.any(distance[candidates] > radius)):
         raise RuntimeError("Directed decoder coverage failed")
     return selected, dict(rule="GNN score ordering with directed strong-path exclusion",
@@ -192,7 +219,6 @@ def graph_decode(scores, native, eligible, indptr, indices, radius):
 
 def local_exploration(frozen, eligible, features, indptr, indices, count, rng):
     """One bounded graph neighbourhood; alternate damage contrast and uniform anchors."""
-    from scipy import sparse
     n = len(frozen)
     eligible = np.asarray(eligible, bool) & (np.diff(indptr) > 0)
     anchors = np.flatnonzero(frozen & eligible)
@@ -312,7 +338,7 @@ class PolicyLearner:
         # The frozen reference and its centering are fixed within this batch.
         # A configurable local prior favours retaining its choices; network
         # score differences still alter the actual Bernoulli probabilities.
-        center = logits.detach()[eligible].median()
+        center = logits[eligible].median()
         bias = float(np.log(self.settings["reference_probability"]/(1-self.settings["reference_probability"])))
         local_logits = (logits-center)/self.settings["sampling_temperature"] + bias*(2*reference.float()-1)
         sample = sample_local(local_logits, reference, torch.as_tensor(mask, device=self.device), eligible)
@@ -460,7 +486,8 @@ def serve(config, endpoint):
     use_cuda = device.type == "cuda"
     if use_cuda and not torch.cuda.is_available():
         raise RuntimeError("Configured CUDA policy device is unavailable")
-    if not use_cuda and config.get("launch_mode") in ("single_node", "parallel_cpu"):
+    colocated = os.environ.get("GNN_COLOCATED_POLICY") == "1"
+    if not colocated and not use_cuda and config.get("launch_mode") in ("single_node", "parallel_cpu"):
         # MPI rank0 waits on the socket during inference, so share its first
         # allocated core rather than requesting a second resource group.
         available = sorted(os.sched_getaffinity(0))
@@ -474,15 +501,30 @@ def serve(config, endpoint):
     model = TwoStagePolicy(len(FEATURE_NAMES), config["training"]["width"]).to(device)
     model.load_state_dict(saved["model"])
     model.eval()
-    mean, scale = saved["feature_mean"], saved["feature_scale"]
+    mean = np.asarray(saved["feature_mean"], dtype=np.float32)
+    scale = np.asarray(saved["feature_scale"], dtype=np.float32)
     fractions = saved["coarse_fraction"]
+    selector = load_selector(config["selector"]) if "selector" in config else None
+    audit_models = {}
+    for name, checkpoint in config.get("comparison_checkpoints", {}).items():
+        assert digest(checkpoint["path"]) == checkpoint["sha256"]
+        state = torch.load(checkpoint["path"], map_location="cpu")
+        assert state["feature_names"] == FEATURE_NAMES
+        candidate = TwoStagePolicy(len(FEATURE_NAMES), config["training"]["width"]).to(device)
+        candidate.load_state_dict(state["model"])
+        candidate.eval()
+        audit_models[name] = (candidate, np.asarray(state["feature_mean"], np.float32),
+                             np.asarray(state["feature_scale"], np.float32), checkpoint["sha256"])
     learner = PolicyLearner(config, model, device, saved) if config["stage"] == "rl" else None
     listener = socket.socket()
-    listener.bind(("0.0.0.0", 0))
+    listener.bind(("127.0.0.1" if colocated else "0.0.0.0", 0))
     listener.listen(1)
     listener.settimeout(600)
     token = secrets.token_hex(32)
-    private = dict(host=socket.gethostname(), port=listener.getsockname()[1], token=token)
+    node = socket.gethostname()
+    cpus = sorted(os.sched_getaffinity(0))
+    private = dict(host="127.0.0.1" if colocated else node, port=listener.getsockname()[1],
+                   token=token, node=node, cpus=cpus, pid=os.getpid())
     pending = Path(str(endpoint)+".pending")
     with os.fdopen(os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
         json.dump(private, f)
@@ -493,7 +535,8 @@ def serve(config, endpoint):
     os.rename(pending, endpoint)
     record(config, "policy_server_ready", endpoint=str(endpoint),
            device=torch.cuda.get_device_name() if use_cuda else "cpu",
-           checkpoint_sha256=config["policy_checkpoint_sha256"], fractional_sizes=fractions.tolist())
+           checkpoint_sha256=config["policy_checkpoint_sha256"], fractional_sizes=fractions.tolist(),
+           node=node, cpus=cpus, colocated=colocated)
     stream, _ = listener.accept()
     stream.settimeout(600)
     hello, _ = receive_packet(stream)
@@ -523,6 +566,10 @@ def serve(config, endpoint):
             if request["operation"] != "select":
                 raise ValueError("Unsupported policy operation")
             begin = time.perf_counter()
+            policy = request.get("policy", "default")
+            network, shift, spread, checkpoint_hash = model, mean, scale, config["policy_checkpoint_sha256"]
+            if policy not in ("default", "prior_only"):
+                network, shift, spread, checkpoint_hash = audit_models[policy]
             stage = request["stage"]
             if stage not in (0, 1):
                 raise ValueError("Invalid stage")
@@ -530,11 +577,20 @@ def serve(config, endpoint):
             n = len(features)
             incoming = np.bincount(arrays["indices"], weights=arrays["weights"], minlength=n)
             prior = np.clip(np.log1p(incoming)-np.log(2), -2, 2).astype(np.float32)
-            network_seconds = 0.0
+            prior_seconds = time.perf_counter() - begin
+            network_seconds = normalization_seconds = 0.0
             if request.get("neutral", False):
                 scores = np.zeros(n, np.float32)
+            elif policy == "prior_only":
+                scores = prior
+                checkpoint_hash = None
             else:
-                x = np.clip((features-mean[stage])/scale[stage], -12, 12).astype(np.float32)
+                normalization_start = time.perf_counter()
+                x = np.empty_like(features, dtype=np.float32)
+                np.subtract(features, shift[stage], out=x)
+                np.divide(x, spread[stage], out=x)
+                np.clip(x, -12, 12, out=x)
+                normalization_seconds = time.perf_counter() - normalization_start
                 if use_cuda:
                     torch.cuda.synchronize()
                 network_start = time.perf_counter()
@@ -542,25 +598,40 @@ def serve(config, endpoint):
                     torch.as_tensor(arrays["indices"], dtype=torch.int64), torch.as_tensor(arrays["weights"]),
                     size=(n, n), device=device)
                 with torch.set_grad_enabled(learner is not None and learner.active(request)):
-                    logits = model(torch.as_tensor(x, device=device), graph,
+                    logits = network(torch.as_tensor(x, device=device), graph,
                         torch.as_tensor(prior, device=device), stage)
                 scores = logits.detach().cpu().numpy()
                 if use_cuda:
                     torch.cuda.synchronize()
                 network_seconds = time.perf_counter()-network_start
                 del graph
+            decode_start = time.perf_counter()
             if config.get("decoder", {}).get("kind") == "directed_graph":
-                selected, decoded = graph_decode(scores, arrays["native"], arrays["eligible"],
-                    arrays["indptr"], arrays["indices"], config["decoder"]["radii"][stage])
+                args = (scores, arrays["native"], arrays["eligible"], arrays["indptr"],
+                        arrays["indices"], config["decoder"]["radii"][stage])
+                selected, decoded = graph_decode(*args, selector=selector)
+                if request.get("check_decoder") and selector is not None:
+                    compiled_seconds = time.perf_counter() - decode_start
+                    reference_start = time.perf_counter()
+                    reference, _ = graph_decode(*args)
+                    if not np.array_equal(reference, selected):
+                        raise RuntimeError("Compiled decoder changed the selected points")
+                    decoded["parity"] = dict(equal=True, compiled_s=compiled_seconds,
+                                             reference_s=time.perf_counter()-reference_start)
             else:
                 selected, decoded = spatial_decode(scores, features, arrays["native"], arrays["eligible"],
                     arrays["indptr"], arrays["indices"], float(fractions[stage]))
+            decode_seconds = time.perf_counter() - decode_start
+            sampling_start = time.perf_counter()
             sampling = None
             if learner is not None and learner.active(request):
                 selected, sampling = learner.sample(request, logits, selected, arrays)
             calls += 1
             reply = dict(stage=stage, sampling=sampling, decoder=decoded,
                 parameter_sha256=learner.identity() if learner is not None else None,
+                policy=policy, checkpoint_sha256=checkpoint_hash, prior_s=prior_seconds,
+                normalization_s=normalization_seconds, decode_s=decode_seconds,
+                sampling_s=time.perf_counter()-sampling_start,
                 network_with_copies_s=network_seconds, device=str(device),
                 service_compute_s=time.perf_counter()-begin, neutral=request.get("neutral", False))
             send_packet(stream, reply, dict(selected=selected))

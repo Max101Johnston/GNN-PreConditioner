@@ -1,5 +1,29 @@
 #!/bin/bash
 set -u -o pipefail
+if [[ "${1:-}" == "--policy-rank" ]]; then
+    set -e
+    config=$2 endpoint=$3 ranks=$4 torch_python=$5 remote_root=$6 image=$7
+    rank=${OMPI_COMM_WORLD_RANK:?Open MPI rank required}
+    command=(singularity exec -B "$remote_root" "$image"
+        /opt/ogs/bin/python3 -B -m gnn_amg.online "$config" "$endpoint")
+    if ((rank % ranks != 0)); then exec "${command[@]}"; fi
+    worker=$((rank / ranks))
+    ready="$endpoint-worker$worker"
+    GNN_POLICY_WORKER="$worker" GNN_COLOCATED_POLICY=1 \
+        "$torch_python" -B -m gnn_amg.inference "$config" "$ready" &
+    pid=$!
+    trap 'kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+    for ((attempt=0; attempt<240; ++attempt)); do
+        [[ ! -f "$ready" ]] || break
+        kill -0 "$pid"
+        sleep .25
+    done
+    [[ -f "$ready" ]]
+    "${command[@]}"
+    wait "$pid"
+    trap - EXIT
+    exit 0
+fi
 config=$(realpath "${1:?analysis configuration}")
 cfg() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$config" "$1"; }
 task=$(cfg output_directory)
@@ -23,6 +47,8 @@ for directory,hashes in [(cfg['source_directory'],cfg['source_hashes']),
     for name,expected in hashes.items():
         assert sha(pathlib.Path(directory)/name)==expected,name
 assert sha(cfg['bridge'])==cfg['bridge_sha256']
+if 'selector' in cfg:
+    assert sha(cfg['selector'])==cfg['selector_sha256']
 assert sha(cfg['image'])==cfg['image_sha256']
 print('FROZEN_GNN_INPUTS_VERIFIED',sha(sys.argv[1]),cfg['image'],flush=True)
 PY
@@ -37,7 +63,7 @@ unset PETSC_OPTIONS SINGULARITYENV_PETSC_OPTIONS
 if [[ "$(cfg stage)" == "pretrain" ]]; then
     export LD_LIBRARY_PATH="$(cfg cuda_toolkit)/lib64:${LD_LIBRARY_PATH:-}"
     "$(cfg torch_python)" -B -m gnn_amg.pretrain "$config"
-elif [[ "$(cfg stage)" == "prediction" || "$(cfg stage)" == "rl" || "$(cfg stage)" == "parallel_smoke" ]]; then
+elif [[ "$(cfg stage)" == "prediction" || "$(cfg stage)" == "rl" || "$(cfg stage)" == "parallel_smoke" || "$(cfg stage)" == "review" ]]; then
     export GNN_RUN_ID="${SLURM_JOB_ID_HET_GROUP_0:-$SLURM_JOB_ID}"
     export SINGULARITYENV_GNN_RUN_ID="$GNN_RUN_ID"
     endpoint="$task/records/rpc-$GNN_RUN_ID.json"
@@ -49,7 +75,8 @@ elif [[ "$(cfg stage)" == "prediction" || "$(cfg stage)" == "rl" || "$(cfg stage
         policy_pids=()
     }
     trap stop_gpu EXIT
-    if [[ "$(cfg stage)" != "parallel_smoke" ]]; then
+    mode=$(cfg launch_mode)
+    if [[ "$(cfg stage)" != "parallel_smoke" && "$mode" != "colocated_cpu" ]]; then
         if [[ "$(cfg launch_mode)" == "parallel_cpu" ]]; then
             for ((worker=0; worker<workers; worker++)); do
                 GNN_POLICY_WORKER="$worker" "$(cfg torch_python)" -B -m gnn_amg.inference "$config" "$endpoint-worker$worker" &
@@ -75,7 +102,7 @@ while not all(path.exists() for path in paths):
 READY
     fi
     net=$(cfg mpi_tcp_interface)
-    if [[ "$(cfg launch_mode)" == "parallel_cpu" ]]; then
+    if [[ "$mode" == "parallel_cpu" || "$mode" == "colocated_cpu" ]]; then
         mpi=(mpirun --mca plm slurm --mca ras slurm --map-by slot --tag-output --bind-to core)
     else
         cpu_host=$(scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_0:-$SLURM_JOB_NODELIST}")
@@ -84,11 +111,17 @@ READY
     fi
     export SINGULARITYENV_OMPI_MCA_btl_tcp_if_include="$net"
     export SINGULARITYENV_OMPI_MCA_oob_tcp_if_include="$net"
+    if [[ "$mode" == "colocated_cpu" ]]; then
+        application=(/bin/bash "$source/scripts/run-gate.sh" --policy-rank "$config" "$endpoint"
+            "$(cfg mpi_ranks)" "$(cfg torch_python)" "$(cfg remote_root)" "$(cfg image)")
+    else
+        application=(singularity exec -B "$(cfg remote_root)" "$(cfg image)"
+            /opt/ogs/bin/python3 -B -m gnn_amg.online "$config" "$endpoint")
+    fi
     mpi_status=0
     timeout --signal=TERM --kill-after=30 "$(cfg mpi_timeout_seconds)" \
         "${mpi[@]}" --mca btl self,vader,tcp --mca btl_tcp_if_include "$net" --mca oob_tcp_if_include "$net" \
-        -np "$((workers*$(cfg mpi_ranks)))" singularity exec -B "$(cfg remote_root)" "$(cfg image)" \
-        /opt/ogs/bin/python3 -B -m gnn_amg.online "$config" "$endpoint" < /dev/null || mpi_status=$?
+        -np "$((workers*$(cfg mpi_ranks)))" "${application[@]}" < /dev/null || mpi_status=$?
     if ((mpi_status!=0)); then
         stop_gpu
         printf '[workers] MPI exit: %s; Policy services stopped after MPI failure\n' "$mpi_status"

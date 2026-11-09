@@ -88,7 +88,7 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
         failure = "first_interpolation_coverage_or_injection"
     proposed_second = None
     if failure is None:
-        pooled, mass = pooled_attributes(p, first, attributes)
+        pooled, mass = pooled_attributes(p, first, attributes, bridge)
         proposed_second, timings["second_decision"] = choose(config, p, bridge, rpc, first.coarse,
             first.native, first.components, pooled, np.zeros(len(first.native), bool), mass, 1, neutral, context)
         second = Level(p, bridge, first.coarse, first.native, first.components, proposed_second,
@@ -121,6 +121,7 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
         shell, callback = replay.pcapply_shell(p, child, operator, k, apply, apply_times)
         replay.setup_solver(p, outer, fs, options)
         setup_s = p.maximum(time.perf_counter()-begin)
+        apply_times.clear()
         if config["stage"] == "rl":
             result = solve_with_deadline(p, replay, outer, full, rhs, solution,
                 config["max_iterations"], max(config["atol"], config["rtol"]*rhs_norm),
@@ -135,10 +136,14 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
         result = dict(reached_true_target=False, total_wall_s=setup_s)
     decoder_name = "graph" if config.get("decoder", {}).get("kind") == "directed_graph" else "spatial"
     result.update(method=("neutral_" if neutral else "gnn_")+decoder_name, failure=failure,
-        setup_wall_s=setup_s, numerical=numerical, timings=timings, gnn_inference=not neutral,
-        checkpoint_sha256=config["policy_checkpoint_sha256"], teacher_hierarchy_read=False,
+        setup_wall_s=setup_s, numerical=numerical, timings=timings,
+        displacement_pc_apply_s=p.maximum(sum(apply_times)), displacement_pc_apply_count=len(apply_times),
+        gnn_inference=not neutral and (context or {}).get("policy") != "prior_only",
+        checkpoint_sha256=(timings["first_decision"].get("policy_reply") or {}).get("checkpoint_sha256"),
+        teacher_hierarchy_read=False,
         policy_update=(context or {}).get("update", 0),
-        checkpoint_scope="Initial checkpoint; policy_update identifies subsequent on-policy updates" if context else "Frozen inference checkpoint",
+        checkpoint_scope="Initial checkpoint; policy_update identifies subsequent on-policy updates"
+            if (context or {}).get("training") else "Frozen inference checkpoint",
         timing_scope="Fresh physical/algebraic features,2decisionpolicy/RPC path,repair,preconditioner construction and complete true-residual-monitored solve. Algebra audits included. Replay input loading and artifact logging excluded for all methods.")
     # Archive raw/executed choices after the measured numerical work.
     arrays = dict(native=gather_array(p, native, layout["ownership"]).astype(np.int64),
@@ -422,6 +427,112 @@ def training_loop(config, p, replay, legacy, bridge, rpc, inventory):
     return 0 if updates and (not smoke or final_check["failures"] == 0) else 2
 
 
+def review(config, p, replay, legacy, bridge, rpc, inventory):
+    """Compare retained, fixed teacher, and deployed policies on training frames."""
+    from .gate import load_teacher, run_method
+
+    workers = config["parallel_workers"]
+    keys = config["gate_keys"]
+    assert len(keys) == workers
+    rows = {row["key"]: row for row in inventory["snapshots"] if row["split"] == "training"}
+    output = Path(config["output_directory"])
+    old = Path(config["baseline_directory"])
+    job = os.environ["GNN_RUN_ID"]
+
+    def save(result, row, label):
+        result.update(key=row["key"], label=label, worker=p.worker, solver_ranks=p.size)
+        if p.rank == 0:
+            path = output / "records" / ("review-%s-w%d-%s.json" % (job, p.worker, label))
+            with path.open("x") as stream:
+                json.dump(result, stream, allow_nan=False, indent=2)
+            record(config, "review_solve", key=row["key"], method=label,
+                   worker=p.worker, accurate=result["reached_true_target"],
+                   iterations=result.get("iterations"), seconds=result.get("total_wall_s"),
+                   failure=result["failure"])
+        return result
+
+    def destroy(data):
+        p.destroy("Vec", data[3], data[4])
+        p.destroy("Mat", data[2])
+
+    # One identical graph, score vector and frame per group. Deliberately keep
+    # the expensive Python equality check out of timed method comparisons.
+    probe = rows[keys[0]]
+    layout, fields, data = load_observed_state(config, p, replay, probe)
+    parity = solve_policy(config, p, replay, legacy, bridge, rpc, probe, layout, fields, data,
+        context=dict(policy="pretrained", check_decoder=True, tag="parity-w%d" % p.worker))
+    save(parity, probe, "decoder_parity")
+    destroy(data)
+
+    row = rows[keys[(p.worker + config.get("review_frame_offset", 0)) % workers]]
+    layout, fields, data = load_observed_state(config, p, replay, row)
+    teacher = load_teacher(config, p, row, layout)
+    entry = teacher["retained_entry"]
+    with np.load(old / "cache" / row["key"] / (entry["shard_pattern"] % p.rank)) as shard:
+        teacher["baseline_empty"] = np.diff(shard["T0_indptr"]) == 0
+
+    # Use the previously accepted executed endpoints at both levels so that a
+    # changed strength topology at K1 cannot silently change the comparison.
+    fixed_job = config["teacher_endpoints_job"]
+    suffix = "%s-%s-r%03d.npz" % (fixed_job, row["key"], p.rank)
+    lo, hi = layout["ownership"][p.rank:p.rank+2]
+    with np.load(output / "data" / ("repair-" + suffix)) as first:
+        np.testing.assert_array_equal(first["native"], teacher["native"][lo:hi])
+        np.testing.assert_array_equal(first["raw_selected"], teacher["depth"][lo:hi] >= 3)
+        teacher["first_mask"] = first["executed_markers"] == 1
+    with np.load(output / "data" / ("repair-second-" + suffix)) as second:
+        np.testing.assert_array_equal(second["native"], teacher["native"][lo:hi][teacher["first_mask"]])
+        np.testing.assert_array_equal(second["raw_selected"], np.isin(second["native"], teacher["terminal_native"]))
+        local_terminal = second["native"][second["executed_markers"] == 1].tolist()
+    terminal = global_teacher_ids(p, local_terminal)
+    teacher["terminal_native"] = np.asarray(terminal, dtype=np.int64)
+    assert len(terminal) <= config["terminal_max_dofs"]
+
+    methods = list(config["review_methods"])
+    rotate = (p.worker * 3) % len(methods)
+    results = []
+    for name in methods[rotate:] + methods[:rotate]:
+        if name in ("amg", "retained_base", "teacher_cached_first", "teacher_cached_first_repaired"):
+            result = run_method(config, p, replay, legacy, bridge, row, layout, data, name, teacher)
+        elif name in config["teacher_variants"]:
+            setting = dict(config["interpolation"], coverage_repair_fraction=0.0)
+            setting.update(config["teacher_variants"][name])
+            result = run_method(dict(config, interpolation=setting), p, replay, legacy, bridge,
+                                row, layout, data, "teacher_multipass_repaired", teacher)
+            result["interpolation"] = setting
+            result["fixed_endpoints_job"] = fixed_job
+        else:
+            result = solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, data,
+                                  context=dict(policy=name, tag=name))
+        results.append(save(result, row, name))
+    destroy(data)
+    if p.rank == 0:
+        rpc.close()
+    packet = dict(worker=p.worker, binding=rpc.binding if p.rank == 0 else None,
+                  parity=parity, results=results)
+    pieces = global_objects(p, packet)
+    if p.global_rank == 0:
+        with (output / "records" / ("review-%s.json" % job)).open("x") as stream:
+            json.dump(dict(job=job, workers=pieces), stream, allow_nan=False, indent=2)
+    # Policy or weight variants can fail numerically. Preserve and report those
+    # outcomes without losing the diagnostic job and its successful controls.
+    controls = [r for item in pieces for r in item["results"]
+                if r["label"] in ("amg", "retained_base", "teacher_current")]
+    return 0 if len(controls) == 3*workers and all(r["reached_true_target"] for r in controls) else 2
+
+
+def global_teacher_ids(p, local_ids):
+    """Share the tiny fixed teacher terminal set inside a solver group."""
+    data = np.asarray(local_ids, dtype=np.int64)
+    counts = p.gather_equal([len(data)]).ravel().astype(np.int32)
+    offsets = np.r_[0, np.cumsum(counts[:-1])].astype(np.int32)
+    collected = np.empty(int(counts.sum()), dtype=np.int64)
+    mpi_int64 = p.P(C.addressof((C.c_char*1).in_dll(p.mpi, "ompi_mpi_int64_t")))
+    assert p.mpi.MPI_Allgatherv(data.ctypes.data, len(data), mpi_int64, collected.ctypes.data,
+                              counts.ctypes.data, offsets.ctypes.data, mpi_int64, p.world) == 0
+    return collected.tolist()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
@@ -453,9 +564,16 @@ def main():
             return 0
         if p.rank == 0:
             endpoint = Path(str(args.endpoint)+"-worker%d" % p.worker) if workers > 1 else args.endpoint
-            rpc = PolicyClient(endpoint)
+            rpc = PolicyClient(endpoint, colocated=config.get("launch_mode") == "colocated_cpu")
+            if rpc.binding:
+                record(config, "solver_policy_binding_verified", worker=p.worker,
+                       global_rank=p.global_rank, **rpc.binding)
         assert digest(old / "data/inventory.json") == config["inventory_sha256"]
         inventory = read_json(old / "data/inventory.json")
+        if config["stage"] == "review":
+            status = review(config, p, replay, legacy, bridge, rpc, inventory)
+            p.call("PetscFinalize")
+            return status
         if config["stage"] == "rl":
             status = training_loop(config, p, replay, legacy, bridge, rpc, inventory)
             p.call("PetscFinalize")

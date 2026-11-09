@@ -97,6 +97,69 @@ def numerical_smoke(config, p, legacy, bridge):
         distributed.close()
 
 
+class RetainedFirst:
+    """Diagnostic P1 and its matching K1, with verified L3 column identity."""
+    def __init__(self, config, p, legacy, row, teacher):
+        from scipy.sparse import csr_matrix
+
+        entry = teacher["retained_entry"]
+        path = (Path(config["baseline_directory"]) / "cache" / row["key"] /
+                (entry["shard_pattern"] % p.rank))
+        assert digest(path) == entry["shards"][p.rank]
+        with np.load(path) as archive:
+            fine_owners, self.owners = archive["ownership0"], archive["ownership1"]
+            transfer, coarse = (
+                csr_matrix((archive[name+"_data"], archive[name+"_indices"], archive[name+"_indptr"]),
+                           shape=archive[name+"_shape"])
+                for name in ("T0", "A1")
+            )
+            lo, hi = fine_owners[p.rank:p.rank+2]
+            np.testing.assert_array_equal(archive["native"], teacher["native"][lo:hi])
+        rows = np.flatnonzero(teacher["depth"][lo:hi] >= 3)
+        positions = transfer.indptr[rows]
+        np.testing.assert_array_equal(np.diff(transfer.indptr)[rows], 1)
+        start, stop = self.owners[p.rank:p.rank+2]
+        columns = transfer.indices[positions]
+        # Retained transfers have energy-scaled columns, so singleton
+        # injection rows identify columns without requiring a unit value.
+        injection = transfer.data[positions]
+        assert np.all(np.isfinite(injection) & (injection != 0))
+        # Cached coarse columns have their own balanced ownership. An injection
+        # row can identify a column owned by another rank.
+        mapping = np.zeros((2, self.owners[-1]), dtype=np.float64)
+        mapping[0, columns] = teacher["native"][lo:hi][rows]
+        np.add.at(mapping[1], columns, 1)
+        mapping = p.reduce(mapping)
+        assert np.all(mapping[1] == 1), "L3 injection is not a bijection"
+        self.native = mapping[0, start:stop].astype(np.int64)
+        self.components = (self.native % 3).astype(np.int32)
+        self.transfer_action = legacy.DistributedSparse(p, transfer, fine_owners, self.owners)
+        self.coarse_action = legacy.DistributedSparse(p, coarse, self.owners, self.owners)
+        self.coarse = self.coarse_action.matrix
+        self.P, self.K = self.transfer_action.apply, self.coarse_action.apply
+        self.stats = dict(coarse_dofs=int(self.owners[-1]), nnz=int(p.reduce([transfer.nnz])[0]),
+                          source="retained_P1")
+
+    def close(self):
+        self.coarse_action.close()
+        self.transfer_action.close()
+
+
+def checked_hierarchy(config, p, legacy, first, second):
+    stats = second.stats
+    if any(stats[k] for k in ("repair_budget_exhausted", "uncovered_free_rows",
+                              "empty_free_rows", "injection_error")):
+        return None, "second_interpolation_coverage_or_injection"
+    if second.owners[-1] > config["terminal_max_dofs"]:
+        return None, "terminal_size_limit"
+    try:
+        return Hierarchy(p, legacy, first, second, config["terminal_max_dofs"]), None
+    except ValueError as error:
+        if str(error) != "terminal_condition_limit":
+            raise
+        return None, str(error)
+
+
 def run_method(config, p, replay, legacy, bridge, row, layout, data, method, teacher):
     old = Path(config["baseline_directory"])
     md, rows, full, rhs, initial = data
@@ -126,23 +189,45 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
             entry = teacher["retained_entry"]
             assert digest(old / "cache" / row["key"] / (entry["shard_pattern"] % p.rank)) == entry["shards"][p.rank]
             space = legacy.SolverRetainedHierarchy(p, old, row, entry, layout)
+            stats["level1"] = dict(coarse_dofs=space.structure["level_dofs"][1],
+                                   nnz=int(p.reduce([space.t0.cpu.nnz])[0]))
+            stats["level2"] = dict(coarse_dofs=space.structure["level_dofs"][2],
+                                   nnz=int(p.reduce([space.t1.cpu.nnz])[0]))
+        elif method in ("teacher_cached_first", "teacher_cached_first_repaired"):
+            first = RetainedFirst(config, p, legacy, row, teacher)
+            stats["level1"] = first.stats
+            terminal = teacher["native"][teacher["depth"] >= 5]
+            fraction = config["interpolation"]["coverage_repair_fraction"] if method.endswith("_repaired") else 0.0
+            second = Level(p, bridge, first.coarse, first.native, first.components,
+                np.isin(first.native, terminal), np.zeros(len(first.native), bool),
+                dict(config["interpolation"], max_coarse_dofs=config["terminal_max_dofs"],
+                     coverage_repair_fraction=fraction))
+            stats["level2"] = second.stats
+            space, failure = checked_hierarchy(config, p, legacy, first, second)
         else:
             native = teacher["native"][lo:hi]
             components = np.asarray(layout["component"][lo:hi], dtype=np.int32)
             assert np.array_equal(native % 3, components)
-            first = Level(p, bridge, k, native, components,
-                teacher["depth"][lo:hi] >= 3, teacher["fixed"][lo:hi], config["interpolation"])
+            first_mask = teacher.get("first_mask")
+            if first_mask is None:
+                first_mask = teacher["depth"][lo:hi] >= 3
+            first = Level(p, bridge, k, native, components, first_mask,
+                          teacher["fixed"][lo:hi], config["interpolation"])
             stats["level1"] = first.stats
             # Rank shards preserve original versus executed selections; these
             # arrays are outputs, never policy labels or on-policy actions.
-            np.savez_compressed(Path(config["output_directory"]) / "data" /
-                ("repair-%s-%s-r%03d.npz" % (os.environ.get("SLURM_JOB_ID", "local"), row["key"], p.rank)),
-                native=native, raw_selected=teacher["depth"][lo:hi] >= 3,
-                executed_markers=first.executed_markers, raw_uncovered=first.raw_uncovered)
+            if config["stage"] != "review":
+                if config["stage"] != "review":
+                    np.savez_compressed(Path(config["output_directory"]) / "data" /
+                        ("repair-%s-%s-r%03d.npz" % (os.environ.get("SLURM_JOB_ID", "local"), row["key"], p.rank)),
+                        native=native, raw_selected=teacher["depth"][lo:hi] >= 3,
+                        executed_markers=first.executed_markers, raw_uncovered=first.raw_uncovered)
             stats["retained_reference_available"] = teacher["retained_entry"] is not None
             if teacher["retained_entry"] is not None:
-                with np.load(old / "cache" / row["key"] / (teacher["retained_entry"]["shard_pattern"] % p.rank)) as f:
-                    baseline_empty = np.diff(f["T0_indptr"]) == 0
+                baseline_empty = teacher.get("baseline_empty")
+                if baseline_empty is None:
+                    with np.load(old / "cache" / row["key"] / (teacher["retained_entry"]["shard_pattern"] % p.rank)) as f:
+                        baseline_empty = np.diff(f["T0_indptr"]) == 0
                 stats["raw_uncovered_nonempty_in_base"] = int(p.reduce([np.count_nonzero(first.raw_uncovered & ~baseline_empty)])[0])
                 mismatches = int(np.count_nonzero(first.special_fine & ~baseline_empty))
                 stats["special_fine_nonempty_in_base"] = int(p.reduce([mismatches])[0])
@@ -159,20 +244,20 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
                 failure = "first_interpolation_coverage_or_injection"
             if failure is None:
                 second_mask = np.isin(first.native, teacher["terminal_native"])
+                setting = dict(config["interpolation"], max_coarse_dofs=config["terminal_max_dofs"])
+                if "second_repair_fraction" in setting:
+                    setting["coverage_repair_fraction"] = setting["second_repair_fraction"]
                 second = Level(p, bridge, first.coarse, first.native, first.components,
-                    second_mask, np.zeros(len(first.native), dtype=bool),
-                    dict(config["interpolation"], max_coarse_dofs=config["terminal_max_dofs"]))
+                    second_mask, np.zeros(len(first.native), dtype=bool), setting)
                 stats["level2"] = second.stats
                 np.savez_compressed(Path(config["output_directory"]) / "data" /
                     ("repair-second-%s-%s-r%03d.npz" % (os.environ.get("SLURM_JOB_ID", "local"), row["key"], p.rank)),
                     native=first.native, raw_selected=second_mask,
                     executed_markers=second.executed_markers, raw_uncovered=second.raw_uncovered)
-                if second.stats["repair_budget_exhausted"] or second.stats["uncovered_free_rows"] or second.stats["empty_free_rows"] or second.stats["injection_error"]:
-                    failure = "second_interpolation_coverage_or_injection"
-                else:
-                    space = Hierarchy(p, legacy, first, second, config["terminal_max_dofs"])
-                    stats["coarse_condition"] = space.condition
+                space, failure = checked_hierarchy(config, p, legacy, first, second)
         if space:
+            if isinstance(space, Hierarchy):
+                stats["coarse_condition"] = space.condition
             stats["galerkin_errors"] = space.parity(fine)
             if max(stats["galerkin_errors"]) > 1e-9:
                 failure = "galerkin_identity"
@@ -190,6 +275,7 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
             shell, callback = replay.pcapply_shell(p, child, operator, k, action, apply_times)
     replay.setup_solver(p, outer, fs, options)
     setup = p.maximum(time.perf_counter()-start)
+    apply_times.clear()
     if failure:
         result = dict(reached_true_target=False, failure=failure)
     else:
@@ -204,6 +290,8 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
         result["total_wall_s"] = p.maximum(result.pop("_solve_end_time")-start)
         result["failure"] = None if result["reached_true_target"] else "gmres_true_residual"
     result.update(method=method, setup_wall_s=setup, numerical=stats,
+        displacement_pc_apply_s=p.maximum(sum(apply_times)) if method != "amg" else None,
+        displacement_pc_apply_count=len(apply_times) if method != "amg" else None,
         includes_teacher_loading=False, gnn_inference=False,
         timing_scope="Gate diagnostic: construction, algebra checks and true-residual monitored solve; not deployment speedup.")
     p.destroy("KSP", outer)
@@ -220,6 +308,33 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
     fine.close()
     p.destroy("Vec", solution)
     return result
+
+
+def load_teacher(config, p, row, layout):
+    old = Path(config["baseline_directory"])
+    key = row["key"]
+    hrecord = read_json(old / "records" / ("hierarchy-" + key + ".json"))
+    hmap = old / "data" / key / hrecord["map_file"]
+    assert digest(hmap) == hrecord["map_sha256"]
+    with np.load(hmap) as f:
+        native = f["native_for_petsc"].copy()
+        depth = f["depth_petsc"].copy()
+    assert np.array_equal(native, 3*layout["native_node"]+layout["component"])
+    field_record = read_json(old / "records" / ("fields-"+key+".json"))
+    assert field_record["manifest"] == row["manifest_sha256"]
+    assert digest(old / "data" / key / "fields.npz") == field_record["sha256"]
+    with np.load(old / "data" / key / "fields.npz") as f:
+        fixed = f["constrained"][native]
+    export_path = old / "records" / ("solver-export-retained-solver-" + key + ".json")
+    entry = None
+    if export_path.exists():
+        export = read_json(export_path)
+        entry = next(e for e in export["spaces"] if e["label"] == config["baseline_label"])
+    elif not config.get("export_supervised"):
+        raise FileNotFoundError(export_path)
+    teacher = dict(native=native, depth=depth, terminal_native=native[depth >= 5],
+                   fixed=fixed, retained_entry=entry)
+    return teacher
 
 
 def main():
@@ -254,27 +369,7 @@ def main():
             p.barrier()
             with np.load(old / "cache" / row["case"] / "layout.npz") as f:
                 layout = {n: f[n] for n in f.files}
-            hrecord = read_json(old / "records" / ("hierarchy-" + key + ".json"))
-            hmap = old / "data" / key / hrecord["map_file"]
-            assert digest(hmap) == hrecord["map_sha256"]
-            with np.load(hmap) as f:
-                native = f["native_for_petsc"].copy()
-                depth = f["depth_petsc"].copy()
-            assert np.array_equal(native, 3*layout["native_node"]+layout["component"])
-            field_record = read_json(old / "records" / ("fields-"+key+".json"))
-            assert field_record["manifest"] == row["manifest_sha256"]
-            assert digest(old / "data" / key / "fields.npz") == field_record["sha256"]
-            with np.load(old / "data" / key / "fields.npz") as f:
-                fixed = f["constrained"][native]
-            export_path = old / "records" / ("solver-export-retained-solver-" + key + ".json")
-            entry = None
-            if export_path.exists():
-                export = read_json(export_path)
-                entry = next(e for e in export["spaces"] if e["label"] == config["baseline_label"])
-            elif not config.get("export_supervised"):
-                raise FileNotFoundError(export_path)
-            teacher = dict(native=native, depth=depth, terminal_native=native[depth >= 5],
-                           fixed=fixed, retained_entry=entry)
+            teacher = load_teacher(config, p, row, layout)
             data = replay.pcapply_snapshot(p, row, layout)
             methods = ("teacher_multipass_repaired",) if config.get("export_supervised") else ("amg", "retained_base", "teacher_multipass_repaired")
             for method in methods:

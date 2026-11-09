@@ -168,8 +168,8 @@ static int uncovered(hypre_ParCSRMatrix *s, int *cf, const int64_t *native,
  * added C points, repair rounds, exhausted-repair-budget flag.
  * The caller supplies actual component IDs; coarse IDs are NOT index modulo 3.
  * Constrained rows use -3 and are handled by the unchanged fine smoother. */
-PetscErrorCode gnn_multipass(Mat a, int *markers, const int *functions,
-                            double strength, double truncation, int max_entries,
+PetscErrorCode gnn_multipass_weighted(Mat a, int *markers, const int *functions,
+                            double strength, double truncation, int max_entries, int weight_option,
                             const int64_t *native, int max_repairs, int *flags,
                             Mat *p, Mat *coarse, long long stats[11])
 {
@@ -214,7 +214,7 @@ PetscErrorCode gnn_multipass(Mat a, int *markers, const int *functions,
     for (PetscInt i = 0; i < m; ++i) hypre_IntArrayData(cf)[i] = markers[i];
     TRY(hypre_BoomerAMGCoarseParms(hypre_ParCSRMatrixComm(h), m, 3, dof, cf, &cdof, &starts));
     TRY(hypre_BoomerAMGBuildMultipass(h, hypre_IntArrayData(cf), s, starts, 3,
-        hypre_IntArrayData(dof), 0, truncation, max_entries, 0, &hp));
+        hypre_IntArrayData(dof), 0, truncation, max_entries, weight_option, &hp));
     TRY(import_parcsr(hp, p));
     stats[0] = hypre_ParCSRMatrixGlobalNumRows(hp);
     stats[1] = hypre_ParCSRMatrixGlobalNumCols(hp);
@@ -320,4 +320,42 @@ cleanup:
     if (err && *graph) MatDestroy(graph);
     return err;
 #undef GRAPH_TRY
+}
+
+PetscErrorCode gnn_multipass(Mat a, int *markers, const int *functions,
+                            double strength, double truncation, int max_entries,
+                            const int64_t *native, int max_repairs, int *flags,
+                            Mat *p, Mat *coarse, long long stats[11])
+{
+    return gnn_multipass_weighted(a, markers, functions, strength, truncation,
+        max_entries, 0, native, max_repairs, flags, p, coarse, stats);
+}
+
+/* Extract owned PETSc rows without crossing the Python FFI per row.
+ * A null columns buffer requests the CSR offsets and exact allocation size. */
+PetscErrorCode gnn_copy_csr(Mat a, int *offsets, int *columns, double *values)
+{
+    PetscInt lo, hi;
+    PetscErrorCode ierr = MatGetOwnershipRange(a, &lo, &hi);CHKERRQ(ierr);
+    int pos = 0;
+    offsets[0] = 0;
+    for (PetscInt i = lo; i < hi; ++i)
+    {
+        PetscInt count;
+        const PetscInt *cols;
+        const PetscScalar *vals;
+        ierr = MatGetRow(a, i, &count, &cols, &vals);CHKERRQ(ierr);
+        if (columns && count)
+        {
+            for (PetscInt j = 0; j < count; ++j)
+            {
+                columns[pos+j] = cols[j];
+                values[pos+j] = vals[j];
+            }
+        }
+        pos += count;
+        offsets[i-lo+1] = pos;
+        ierr = MatRestoreRow(a, i, &count, &cols, &vals);CHKERRQ(ierr);
+    }
+    return 0;
 }

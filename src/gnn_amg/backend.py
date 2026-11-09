@@ -103,10 +103,17 @@ class Level:
         budget = int(proposed * setting.get("coverage_repair_fraction", 0.0))
         if "max_coarse_dofs" in setting:
             budget = min(budget, max(0, setting["max_coarse_dofs"] - proposed))
-        code = bridge.gnn_multipass(matrix, cf.ctypes.data, functions.ctypes.data,
-            setting["strength_threshold"], setting["truncation"], setting["max_entries"],
-            native.ctypes.data, budget, flags.ctypes.data,
-            C.byref(self.transfer), C.byref(self.coarse), stats.ctypes.data)
+        args = (matrix, cf.ctypes.data, functions.ctypes.data, setting["strength_threshold"],
+                setting["truncation"], setting["max_entries"])
+        suffix = (native.ctypes.data, budget, flags.ctypes.data,
+                  C.byref(self.transfer), C.byref(self.coarse), stats.ctypes.data)
+        weight = setting.get("weight_option", 0)
+        if weight not in (0, 1):
+            raise ValueError("Expected ordinary or sign-separated multipass weights")
+        if weight:
+            code = bridge.gnn_multipass_weighted(*args, weight, *suffix)
+        else:
+            code = bridge.gnn_multipass(*args, *suffix)
         if code:
             raise RuntimeError("multipass native error %d" % code)
         self.stats = dict(zip(["fine_dofs", "coarse_dofs", "uncovered_free_rows", "empty_free_rows", "nnz", "special_fine_rows", "raw_uncovered_9_hops", "raw_uncovered_99_hops", "repair_added_coarse", "repair_rounds", "repair_budget_exhausted"], map(int, stats)))
@@ -202,16 +209,32 @@ def load_bridge(p, path):
     bridge.gnn_multipass.argtypes = [p.P, p.P, p.P, p.D, p.D, p.I, p.P, p.I, p.P,
                                     C.POINTER(p.P), C.POINTER(p.P), p.P]
     bridge.gnn_multipass.restype = p.I
+    if hasattr(bridge, "gnn_multipass_weighted"):
+        args = bridge.gnn_multipass.argtypes
+        bridge.gnn_multipass_weighted.argtypes = args[:6] + [p.I] + args[6:]
+        bridge.gnn_multipass_weighted.restype = p.I
+    if hasattr(bridge, "gnn_copy_csr"):
+        bridge.gnn_copy_csr.argtypes = [p.P, p.P, p.P, p.P]
+        bridge.gnn_copy_csr.restype = p.I
     return bridge
 
 
-def local_csr(p, matrix):
+def local_csr(p, matrix, bridge=None):
     """Copy owned rows only; global column numbers preserve MPI-boundary edges."""
     from scipy.sparse import csr_matrix
     owners = ownership(p, matrix)
     lo, hi = map(int, owners[p.rank:p.rank+2])
     n, width = p.I(), p.I()
     p.call("MatGetSize", matrix, C.byref(n), C.byref(width))
+    if bridge is not None and hasattr(bridge, "gnn_copy_csr"):
+        offsets = np.empty(hi-lo+1, np.int32)
+        if bridge.gnn_copy_csr(matrix, offsets.ctypes.data, None, None):
+            raise RuntimeError("Cannot size native CSR")
+        columns = np.empty(offsets[-1], np.int32)
+        values = np.empty(offsets[-1], np.float64)
+        if bridge.gnn_copy_csr(matrix, offsets.ctypes.data, columns.ctypes.data, values.ctypes.data):
+            raise RuntimeError("Cannot copy native CSR")
+        return csr_matrix((values, columns, offsets), shape=(hi-lo, width.value)), owners
     indptr, indices, data = [0], [], []
     for row in range(lo, hi):
         count, columns, values = p.I(), p.P(), p.P()
@@ -236,7 +259,7 @@ def graph_features(p, bridge, matrix, components, attributes, constrained, stage
     code = bridge.gnn_graph(matrix, functions.ctypes.data, strength, C.byref(graph), algebra.ctypes.data)
     if code:
         raise RuntimeError("Graph export error %d" % code)
-    adjacency, owners = local_csr(p, graph)
+    adjacency, owners = local_csr(p, graph, bridge)
     p.destroy("Mat", graph)
     features = np.column_stack([attributes, algebra, np.eye(3)[components],
         constrained.astype(float), np.full(len(functions), stage), np.log1p(support)]).astype(np.float32)
@@ -247,13 +270,13 @@ def graph_features(p, bridge, matrix, components, attributes, constrained, stage
     return features, adjacency, owners
 
 
-def pooled_attributes(p, level, attributes):
+def pooled_attributes(p, level, attributes, bridge=None):
     """Fixed |P| support means of fine attributes and support mass.
 
     The caller includes phi and phi squared, so their means also encode the
     support variance. These statistics are not a coarse physical-field solve.
     """
-    transfer, _ = local_csr(p, level.transfer)
+    transfer, _ = local_csr(p, level.transfer, bridge)
     transfer.data = np.abs(transfer.data)
     mass = p.reduce(np.asarray(transfer.sum(axis=0)).ravel())
     weighted = p.reduce(transfer.T @ attributes)

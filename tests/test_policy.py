@@ -106,6 +106,9 @@ class PolicyTests(unittest.TestCase):
                 self.assertTrue(torch.equal(p, initial[name]))
         for parameter, derivative in zip(trainable, expected):
             torch.testing.assert_close(parameter.grad, derivative)
+        # A common shift of all logits leaves the centered probabilities unchanged.
+        bias_grad = model.heads[1].bias.grad
+        torch.testing.assert_close(bias_grad, torch.zeros_like(bias_grad), rtol=0, atol=1e-7)
         import contextlib
         import io
         with contextlib.redirect_stdout(io.StringIO()):

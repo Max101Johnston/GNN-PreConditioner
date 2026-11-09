@@ -3,6 +3,7 @@
 This module's feature functions also serve online inference. Only export_state
 reads teacher labels; graph_features and pooled_attributes are label-free.
 """
+import ctypes as C
 from pathlib import Path
 import os
 import numpy as np
@@ -36,18 +37,28 @@ def physical_attributes(fields, xyz, native):
 
 
 def gather_array(p, values, owners):
-    a = np.asarray(values)
+    a = np.ascontiguousarray(values)
     width = int(np.prod(a.shape[1:])) if a.ndim > 1 else 1
-    result = p.gather_rows(a.ravel(), owners * width)
-    return result.reshape((-1,) + a.shape[1:])
+    offsets = owners * width * a.itemsize
+    if offsets[-1] > np.iinfo(np.int32).max:
+        raise ValueError("MPI byte gather exceeds the supported message size")
+    counts = np.diff(offsets).astype(np.int32)
+    starts = offsets[:-1].astype(np.int32)
+    result = np.empty((owners[-1] if p.rank == 0 else 0,) + a.shape[1:], dtype=a.dtype)
+    mpi_byte = p.P(C.addressof((C.c_char*1).in_dll(p.mpi, "ompi_mpi_byte")))
+    status = p.mpi.MPI_Gatherv(a.ctypes.data, a.nbytes, mpi_byte, result.ctypes.data,
+                               counts.ctypes.data, starts.ctypes.data, mpi_byte, 0, p.world)
+    if status:
+        raise RuntimeError("MPI typed gather failed: %d" % status)
+    return result
 
 
 def gather_graph(p, graph, owners):
-    lengths = p.gather_rows(np.diff(graph.indptr), owners)
+    lengths = gather_array(p, np.diff(graph.indptr), owners)
     counts = p.gather_equal([len(graph.data)]).ravel().astype(np.int64)
     offsets = np.r_[0, np.cumsum(counts)]
-    columns = p.gather_rows(graph.indices, offsets)
-    weights = p.gather_rows(graph.data, offsets)
+    columns = gather_array(p, graph.indices.astype(np.int32, copy=False), offsets)
+    weights = gather_array(p, graph.data.astype(np.float32), offsets)
     if p.rank:
         return None
     return dict(indptr=np.r_[0, np.cumsum(lengths)].astype(np.int64),
