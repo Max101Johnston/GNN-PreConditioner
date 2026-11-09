@@ -49,6 +49,8 @@ for directory,hashes in [(cfg['source_directory'],cfg['source_hashes']),
 assert sha(cfg['bridge'])==cfg['bridge_sha256']
 if 'selector' in cfg:
     assert sha(cfg['selector'])==cfg['selector_sha256']
+if 'student_library' in cfg:
+    assert sha(cfg['student_library'])==cfg['student_library_sha256']
 assert sha(cfg['image'])==cfg['image_sha256']
 print('FROZEN_GNN_INPUTS_VERIFIED',sha(sys.argv[1]),cfg['image'],flush=True)
 PY
@@ -60,7 +62,10 @@ export SINGULARITYENV_PYTHONPATH="$PYTHONPATH:$(cfg container_pythonpath)"
 export SINGULARITYENV_PYTHONDONTWRITEBYTECODE=1
 unset PETSC_OPTIONS SINGULARITYENV_PETSC_OPTIONS
 "$(cfg torch_python)" -B -m unittest discover -s "$source/tests"
-if [[ "$(cfg stage)" == "pretrain" ]]; then
+if [[ "$(cfg stage)" == "student_train" ]]; then
+    export LD_LIBRARY_PATH="$(cfg cuda_toolkit)/lib64:${LD_LIBRARY_PATH:-}"
+    "$(cfg torch_python)" -B -m gnn_amg.train_student "$config"
+elif [[ "$(cfg stage)" == "pretrain" ]]; then
     export LD_LIBRARY_PATH="$(cfg cuda_toolkit)/lib64:${LD_LIBRARY_PATH:-}"
     "$(cfg torch_python)" -B -m gnn_amg.pretrain "$config"
 elif [[ "$(cfg stage)" == "prediction" || "$(cfg stage)" == "rl" || "$(cfg stage)" == "parallel_smoke" || "$(cfg stage)" == "review" ]]; then
@@ -76,7 +81,7 @@ elif [[ "$(cfg stage)" == "prediction" || "$(cfg stage)" == "rl" || "$(cfg stage
     }
     trap stop_gpu EXIT
     mode=$(cfg launch_mode)
-    if [[ "$(cfg stage)" != "parallel_smoke" && "$mode" != "colocated_cpu" ]]; then
+    if [[ "$(cfg stage)" != "parallel_smoke" && "$mode" != "colocated_cpu" && "$mode" != "native_cpu" ]]; then
         if [[ "$(cfg launch_mode)" == "parallel_cpu" ]]; then
             for ((worker=0; worker<workers; worker++)); do
                 GNN_POLICY_WORKER="$worker" "$(cfg torch_python)" -B -m gnn_amg.inference "$config" "$endpoint-worker$worker" &
@@ -102,7 +107,7 @@ while not all(path.exists() for path in paths):
 READY
     fi
     net=$(cfg mpi_tcp_interface)
-    if [[ "$mode" == "parallel_cpu" || "$mode" == "colocated_cpu" ]]; then
+    if [[ "$mode" == "parallel_cpu" || "$mode" == "colocated_cpu" || "$mode" == "native_cpu" ]]; then
         mpi=(mpirun --mca plm slurm --mca ras slurm --map-by slot --tag-output --bind-to core)
     else
         cpu_host=$(scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_0:-$SLURM_JOB_NODELIST}")

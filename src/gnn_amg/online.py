@@ -50,8 +50,16 @@ def choose(config, p, bridge, rpc, matrix, native, comp, attributes, fixed, mass
             begin = time.perf_counter()
             scores = connection_prior(arrays["indices"], arrays["weights"], len(arrays["native"]))
             selector = load_selector(config["selector"]) if "selector" in config else None
-            selected, decoder = graph_decode(scores, arrays["native"], arrays["eligible"],
-                arrays["indptr"], arrays["indices"], config["decoder"]["radii"][stage], selector=selector)
+            radius = config["decoder"]["radii"][stage]
+            if stage == 1 and context is not None:
+                radius = max(radius, context.get("terminal_min_radius", radius))
+            while True:
+                selected, decoder = graph_decode(scores, arrays["native"], arrays["eligible"],
+                    arrays["indptr"], arrays["indices"], radius, selector=selector)
+                adaptive = config.get("student_cycle") and stage == 1
+                if not adaptive or int(selected.sum()) <= config["terminal_max_dofs"] or radius == 9:
+                    break
+                radius += 1
             reply = dict(policy="prior_only", decoder=decoder, device="cpu",
                          network_with_copies_s=0.0, checkpoint_sha256=None,
                          service_compute_s=time.perf_counter()-begin)
@@ -98,28 +106,40 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
         raise ValueError("The fast path requires deterministic directed-graph prior selection")
     attributes = None if fast else physical_attributes(fields, layout["xyz"], native)
     first = second = space = shell = callback = None
+    first_seed = second_seed = None
+    export_level = (context or {}).get("export_teacher_level", 0)
+    models = (context or {}).get("students", {})
     numerical, timings, failure = {}, {}, None
     proposed_first, timings["first_decision"] = choose(config, p, bridge, rpc, k, native, comp,
         attributes, fixed, None if fast else np.ones(len(native)), 0, neutral, context)
     sweeps = (context or {}).get("p1_refinement_sweeps", 0)
     initial_start = time.perf_counter()
     first = Level(p, bridge, k, native, comp, proposed_first, fixed, config["interpolation"],
-                  form_coarse=not (fast and sweeps))
+                  form_coarse=not (fast and (sweeps or "p1" in models)))
+    if export_level == 1:
+        first_seed = first
     numerical["p1_initial_s"] = p.maximum(time.perf_counter()-initial_start)
     numerical["level1"] = first.stats
     if first.stats["uncovered_free_rows"] or first.stats["empty_free_rows"] or first.stats["injection_error"] or first.stats["repair_budget_exhausted"]:
         failure = "first_interpolation_coverage_or_injection"
-    if sweeps and failure is None:
-        from .interpolation import enrich_first
-
+    if (sweeps or "p1" in models) and failure is None:
         refine_start = time.perf_counter()
         try:
-            refined = enrich_first(p, legacy, bridge, k, first, sweeps,
-                                   config["p1_refinement_row_budget"], native_scaling=fast)
+            if "p1" in models:
+                from .student import student_level, DEFAULT_CONTROL
+
+                refined = student_level(config, p, legacy, bridge, k, first, comp, models["p1"], 1,
+                    controls=context.get("controls_p1", DEFAULT_CONTROL), global_components=layout["component"])
+            else:
+                from .interpolation import enrich_first
+
+                refined = enrich_first(p, legacy, bridge, k, first, sweeps,
+                                       config["p1_refinement_row_budget"], native_scaling=fast)
         except ValueError as error:
             failure = str(error)
         else:
-            first.close()
+            if first is not first_seed:
+                first.close()
             first = refined
             numerical["level1"] = first.stats
         numerical["p1_refinement_s"] = p.maximum(time.perf_counter()-refine_start)
@@ -128,7 +148,7 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
         pooled, mass = (None, None) if fast else pooled_attributes(p, first, attributes, bridge)
         proposed_second, timings["second_decision"] = choose(config, p, bridge, rpc, first.coarse,
             first.native, first.components, pooled, np.zeros(len(first.native), bool), mass, 1, neutral, context)
-        builder = (context or {}).get("p2_builder", "direct")
+        builder = "student" if "p2" in models else (context or {}).get("p2_builder", "direct")
         if builder == "staged":
             from .interpolation import staged_level
 
@@ -141,28 +161,41 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
             second, numerical["level2"], failure = harmonic_level(
                 config, p, legacy, bridge, first, proposed_second,
                 context["p2_entries"], broadcast_json)
-        elif builder in ("direct", "weights"):
+        elif builder in ("direct", "weights", "student"):
             setting = dict(config["interpolation"], max_coarse_dofs=config["terminal_max_dofs"])
-            if builder == "weights":
+            if builder != "direct":
                 setting["coverage_repair_fraction"] = 0.0
             second = Level(p, bridge, first.coarse, first.native, first.components, proposed_second,
                 np.zeros(len(first.native), bool), setting, form_coarse=builder == "direct")
             numerical["level2"] = second.stats
-            if builder == "weights":
-                from .interpolation import refine_second
-
+            if builder != "direct":
                 original = second
+                if export_level == 2:
+                    second_seed = original
                 second = None
                 bad = any(original.stats[k] for k in ("uncovered_free_rows", "empty_free_rows",
                                                        "injection_error", "repair_budget_exhausted"))
                 if bad or original.owners[-1] > config["terminal_max_dofs"]:
-                    failure = "p2_weight_seed_failed"
-                else:
+                    failure = "p2_seed_failed"
+                elif builder == "weights":
+                    from .interpolation import refine_second
+
                     second, numerical["level2"] = refine_second(p, legacy, bridge, first, original,
                         context["p2_expand_budget"], broadcast_json)
                     if second is None:
                         failure = "p2_weight_optimization_failed"
-                original.close()
+                else:
+                    from .student import student_level, DEFAULT_CONTROL
+
+                    try:
+                        second = student_level(config, p, legacy, bridge, first.coarse, original,
+                            first.components, models["p2"], 2, controls=context.get("controls_p2", DEFAULT_CONTROL))
+                    except ValueError as error:
+                        failure = str(error)
+                    else:
+                        numerical["level2"] = second.stats
+                if original is not second_seed:
+                    original.close()
         else:
             raise ValueError("Unknown P2 builder: " + builder)
         if second is None:
@@ -181,6 +214,16 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
             if space is not None:
                 numerical["condition"] = space.condition
                 numerical["galerkin_errors"] = space.parity(fine)
+                if export_level:
+                    space.direction_samples = []
+                if config.get("student_cycle"):
+                    bridge.gnn_local_nnz.argtypes = [p.P, C.POINTER(p.D)]
+                    bridge.gnn_local_nnz.restype = p.I
+                    nnz = p.D()
+                    code = bridge.gnn_local_nnz(first.coarse, C.byref(nnz))
+                    if code:
+                        raise RuntimeError("Cannot query K1 nonzeros: %d" % code)
+                    numerical["k1_nnz"] = int(p.reduce([nnz.value])[0])
                 if max(numerical["galerkin_errors"]) > 1e-9:
                     failure = "galerkin_identity"
     apply_times = []
@@ -195,7 +238,10 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
         replay.setup_solver(p, outer, fs, options)
         setup_s = p.maximum(time.perf_counter()-begin)
         apply_times.clear()
-        if config["stage"] == "rl":
+        if export_level:
+            space.direction_samples.clear()
+            space.direction_calls = 0
+        if config["stage"] == "rl" or config.get("student_cycle") == "tune":
             result = solve_with_deadline(p, replay, outer, full, rhs, solution,
                 config["max_iterations"], max(config["atol"], config["rtol"]*rhs_norm),
                 begin+config["training"]["episode_timeout_seconds"])
@@ -211,7 +257,8 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     result.update(method=("neutral_" if neutral else "gnn_")+decoder_name, failure=failure,
         setup_wall_s=setup_s, numerical=numerical, timings=timings,
         displacement_pc_apply_s=p.maximum(sum(apply_times)), displacement_pc_apply_count=len(apply_times),
-        gnn_inference=not neutral and (context or {}).get("policy") != "prior_only",
+        gnn_inference=bool(models) or (not neutral and (context or {}).get("policy") != "prior_only"),
+        interpolation_students={name:model["sha256"] for name,model in models.items()},
         checkpoint_sha256=(timings["first_decision"].get("policy_reply") or {}).get("checkpoint_sha256"),
         teacher_hierarchy_read=False,
         policy_update=(context or {}).get("update", 0),
@@ -224,21 +271,35 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
             values.eliminate_zeros()
             values.sort_indices()
             capture[name] = values
+    if export_level and result["reached_true_target"]:
+        from .student import export_teacher
+
+        q = [directions[export_level-1] for directions in space.direction_samples]
+        if export_level == 1:
+            receipt = export_teacher(config, p, legacy, bridge, row, k, first_seed, first, comp, q, 1,
+                native, layout["component"], fields["phi"][native//3])
+        else:
+            receipt = export_teacher(config, p, legacy, bridge, row, first.coarse, second_seed, second,
+                first.components, q, 2, first.native)
+        if p.rank == 0:
+            result["student_teacher"] = receipt
     # Archive raw/executed choices after the measured numerical work.
-    arrays = dict(native=gather_array(p, native, layout["ownership"]).astype(np.int64),
-        raw_first=gather_array(p, proposed_first, layout["ownership"]).astype(bool),
-        executed_first=gather_array(p, first.executed_markers, layout["ownership"]).astype(np.int8))
-    if proposed_second is not None:
-        arrays.update(coarse_native=gather_array(p, first.native, first.owners).astype(np.int64),
-            raw_second=gather_array(p, proposed_second, first.owners).astype(bool))
-        if second is not None:
-            arrays["executed_second"] = gather_array(p, second.executed_markers, first.owners).astype(np.int8)
-    if p.rank == 0:
-        run = os.environ.get("GNN_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
-        path = Path(config["output_directory"]) / "data" / ("prediction-%s-%s-%s%s.npz" % (run, row["key"], result["method"], "-"+context["tag"] if context else ""))
-        with path.open("xb") as f:
-            np.savez_compressed(f, **arrays)
-        result["raw_executed_choices"] = dict(path=str(path), sha256=digest(path))
+    arrays = {}
+    if (context or {}).get("archive_choices", True):
+        arrays = dict(native=gather_array(p, native, layout["ownership"]).astype(np.int64),
+            raw_first=gather_array(p, proposed_first, layout["ownership"]).astype(bool),
+            executed_first=gather_array(p, first.executed_markers, layout["ownership"]).astype(np.int8))
+        if proposed_second is not None:
+            arrays.update(coarse_native=gather_array(p, first.native, first.owners).astype(np.int64),
+                raw_second=gather_array(p, proposed_second, first.owners).astype(bool))
+            if second is not None:
+                arrays["executed_second"] = gather_array(p, second.executed_markers, first.owners).astype(np.int8)
+        if p.rank == 0:
+            run = os.environ.get("GNN_RUN_ID", os.environ.get("SLURM_JOB_ID", "local"))
+            path = Path(config["output_directory"]) / "data" / ("prediction-%s-%s-%s%s.npz" % (run, row["key"], result["method"], "-"+context["tag"] if context else ""))
+            with path.open("xb") as f:
+                np.savez_compressed(f, **arrays)
+            result["raw_executed_choices"] = dict(path=str(path), sha256=digest(path))
     if result["reached_true_target"] and (context or {}).get("export_p2_sample"):
         from .interpolation import collect_csr
 
@@ -259,6 +320,10 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
         space.close()
     if second is not None:
         second.close()
+    if second_seed is not None and second_seed is not second:
+        second_seed.close()
+    if first_seed is not None and first_seed is not first:
+        first_seed.close()
     first.close()
     local.close()
     fine.close()
@@ -728,7 +793,7 @@ def main():
                 record(config, "parallel_communicators_passed", total_ranks=p.global_size, workers=receipts)
             p.call("PetscFinalize")
             return 0
-        if p.rank == 0:
+        if p.rank == 0 and not config.get("student_cycle"):
             endpoint = Path(str(args.endpoint)+"-worker%d" % p.worker) if workers > 1 else args.endpoint
             rpc = PolicyClient(endpoint, colocated=config.get("launch_mode") == "colocated_cpu")
             if rpc.binding:
@@ -736,6 +801,12 @@ def main():
                        global_rank=p.global_rank, **rpc.binding)
         assert digest(old / "data/inventory.json") == config["inventory_sha256"]
         inventory = read_json(old / "data/inventory.json")
+        if config.get("student_cycle"):
+            from .student_cycle import run_cycle
+
+            status = run_cycle(config, p, replay, legacy, bridge, inventory)
+            p.call("PetscFinalize")
+            return status
         if config["stage"] == "review":
             status = review(config, p, replay, legacy, bridge, rpc, inventory)
             p.call("PetscFinalize")

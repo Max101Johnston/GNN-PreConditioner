@@ -416,3 +416,70 @@ PetscErrorCode gnn_abs_row_sums(Mat a, double *sums)
     }
     return 0;
 }
+
+/* Native local features and the strongest signed off-diagonal path list.
+ * The list may include cross-component and weak edges discarded by HYPRE S. */
+PetscErrorCode gnn_student_stiffness(Mat a, const int *components, int paths,
+    double *sums, float *features, int *columns, double *weights)
+{
+    PetscInt lo, hi;
+    if (paths < 0 || paths > 8) return PETSC_ERR_ARG_OUTOFRANGE;
+    PetscErrorCode ierr = MatGetOwnershipRange(a, &lo, &hi);CHKERRQ(ierr);
+    for (PetscInt row = lo; row < hi; ++row)
+    {
+        PetscInt count;
+        const PetscInt *cols;
+        const PetscScalar *values;
+        ierr = MatGetRow(a, row, &count, &cols, &values);CHKERRQ(ierr);
+        double norm = count ? fabs(values[0])+abs_pairwise_sum(values+1, count-1) : 0.0;
+        double safe = fmax(norm, 1e-30), diag = 0, pos = 0, neg = 0, cross = 0;
+        int local = row-lo, offset = local*paths;
+        for (int j = 0; j < paths; ++j)
+        {
+            columns[offset+j] = -1;
+            weights[offset+j] = 0.0;
+        }
+        for (PetscInt j = 0; j < count; ++j)
+        {
+            int col = cols[j];
+            double val = values[j];
+            if (col == row) { diag = val; continue; }
+            if (val > 0) pos += val; else neg -= val;
+            if (components[col] != components[row]) cross += fabs(val);
+            if (!paths || val == 0.0) continue;
+            double scaled = val/safe;
+            for (int k = 0; k < paths; ++k)
+            {
+                int at = offset+k;
+                double old = fabs(weights[at]);
+                if (fabs(scaled) < old || (fabs(scaled) == old && col >= columns[at])) continue;
+                for (int l = paths-1; l > k; --l)
+                {
+                    columns[offset+l] = columns[offset+l-1];
+                    weights[offset+l] = weights[offset+l-1];
+                }
+                columns[at] = col;
+                weights[at] = scaled;
+                break;
+            }
+        }
+        sums[local] = norm;
+        float *f = features+10*local;
+        f[0] = (float)(0.05*log1p(norm));
+        f[1] = (float)(diag/safe);
+        f[2] = (float)(pos/safe);
+        f[3] = (float)(neg/safe);
+        f[4] = (float)(cross/safe);
+        f[5] = (float)(0.5*components[row]);
+        ierr = MatRestoreRow(a, row, &count, &cols, &values);CHKERRQ(ierr);
+    }
+    return 0;
+}
+
+PetscErrorCode gnn_local_nnz(Mat a, double *nnz)
+{
+    MatInfo info;
+    PetscErrorCode ierr = MatGetInfo(a, MAT_LOCAL, &info);CHKERRQ(ierr);
+    *nnz = info.nz_used;
+    return 0;
+}

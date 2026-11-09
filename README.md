@@ -201,3 +201,33 @@ checkpoint contains synchronized model and optimizer state. Per-worker sampling
 is seeded by the global update index and worker ID, making continuation explicit.
 Parallel training throughput is recorded separately from single-solve latency;
 a resource allocation is not by itself proof of a solver speed improvement.
+
+## Learned interpolation cycle
+
+The deterministic connection prior supplies C1 and C2. Student A consumes
+one actual `K P0` product and predicts row damping and one of the 6, 8 or
+12 entry budgets. Student B adds a bounded signed path product with four
+couplings and an eight-entry row seed. Its shared edge model predicts signed
+coefficients and priorities on at most 24 candidates. PETSc communicates
+matrix rows across the actual ownership boundaries before local inference.
+
+The native library uses the portable NPZ export from
+`gnn_amg.train_student`. Each solver rank loads the coefficients once and
+generates its own sparse rows. Protected rows come from the original transfer.
+The driver computes Galerkin operators, the small terminal solve, and the
+original FieldSplit GMRES residual check. Candidate generation and inference
+are included in the setup clock.
+
+Use `scripts/student-pipeline.py` with an external plan JSON pointing at a
+frozen run config, its monitor and a task record. The workflow verifies
+training-only teacher receipts and four sampled coarse directions from
+actual solves. It fits A/B on two seeds and the secondary student in a single
+training allocation, checks PyTorch/native parity, compares checkpoints in
+full solves, refreshes P2 on the selected P1, and uses paired elapsed seconds
+for the low-dimensional controller. The remaining validation and test keys
+enter after selection. The pipeline state records actual Slurm job IDs and
+immutable submission receipts for recovery.
+
+The deployment entry point in this repository is the saved-matrix
+FieldSplit replay. A positive speed gate is the prerequisite for the
+separate continuous OGS restart comparison.

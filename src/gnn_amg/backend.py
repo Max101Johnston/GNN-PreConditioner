@@ -183,6 +183,8 @@ class Hierarchy:
             raise ValueError("terminal_condition_limit")
         self.factor = la.lu_factor(self.energy)
         self.solve = la.lu_solve
+        self.direction_samples = None
+        self.direction_calls = 0
 
     def gain(self, residual):
         a, b = self.first, self.second
@@ -194,6 +196,10 @@ class Hierarchy:
         lo, hi = map(int, b.owners[self.p.rank:self.p.rank+2])
         answer += b.P(correction[lo:hi])
         answer += self.middle.apply(rhs - a.K(answer))
+        if self.direction_samples is not None:
+            if self.direction_calls in (0, 2, 6, 14):
+                self.direction_samples.append((answer.copy(), correction[lo:hi].copy()))
+            self.direction_calls += 1
         return a.P(answer)
 
     def parity(self, fine):
