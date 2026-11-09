@@ -243,3 +243,9 @@ builds the same displacement hierarchy as replay inside the live TH2M GMRES
 setup and measures the full solve with the same true-residual tolerance.
 The pilot fails on a missing hook, a numerical guard, or an incomplete final
 timestep. Runtime files and OGS results stay outside this repository.
+
+The live `methods` list can include `amg` to measure the original OGS
+displacement BoomerAMG on the same loading trajectory. This control retains
+the production HYPRE options and uses the same full-system GMRES tolerances,
+true-residual checks and output schedule as the learned hierarchy. PETSc
+reports the instantiated displacement PC before the first solve.

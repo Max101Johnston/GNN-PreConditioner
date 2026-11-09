@@ -16,6 +16,13 @@ from gnn_amg.online import prepare_displacement
 from gnn_amg.student import load_student
 
 
+def method_names(settings):
+    names = tuple(settings.get("methods", ("reference", "student")))
+    assert names and len(set(names)) == len(names)
+    assert set(names) <= {"reference", "student", "amg"}
+    return names
+
+
 def prepare(config_path, directory):
     """Freeze the original loading inputs and rebuild the RAS overlap at source rank count."""
     config = read_json(config_path)
@@ -41,7 +48,6 @@ def prepare(config_path, directory):
         ("<OpenGeoSysProject>", "<OpenGeoSysProject>\n    <python_script>live.py</python_script>", 1),
         ("<t_end>300</t_end>", "<t_end>%s</t_end>" % settings["end_s"], 2),
         ("-th2m_ksp_max_it 100", "-th2m_ksp_max_it %d" % config["max_iterations"], 1),
-        ("-th2m_fieldsplit_1_pc_type hypre", "-th2m_fieldsplit_1_pc_type none", 1),
         ("<record_matrix_snapshots>true</record_matrix_snapshots>",
          "<record_matrix_snapshots>false</record_matrix_snapshots>", 1),
         ("<record_ksp_history>true</record_ksp_history>",
@@ -50,9 +56,18 @@ def prepare(config_path, directory):
     for before, after, count in changes:
         assert raw.count(before) == count, before
         raw = raw.replace(before, after)
-    prepared_project = directory / project.name
-    with prepared_project.open("x") as f:
-        f.write(raw)
+    methods = method_names(settings)
+    amg_option = "-th2m_fieldsplit_1_pc_type hypre"
+    assert raw.count(amg_option) == 1
+    projects = {}
+    for method in methods:
+        prepared_project = directory / ("amg.prj" if method == "amg" else project.name)
+        if prepared_project.name not in projects:
+            text = raw if method == "amg" else raw.replace(amg_option, "-th2m_fieldsplit_1_pc_type none")
+            with prepared_project.open("x") as f:
+                f.write(text)
+            projects[prepared_project.name] = dict(path=str(prepared_project), sha256=digest(prepared_project))
+    prepared_project = next(iter(projects.values()))
 
     baseline = Path(config["baseline_directory"])
     inv_path = baseline / "data/inventory.json"
@@ -82,16 +97,17 @@ def prepare(config_path, directory):
             assert np.array_equal(fixed, mask), row["key"]
     with (directory / "constrained.npy").open("xb") as f:
         np.save(f, fixed, allow_pickle=False)
-    for level, model in settings["student"]["students"].items():
-        load_student(model["path"], model["sha256"], int(level[1:]))
+    if "student" in methods:
+        for level, model in settings["student"]["students"].items():
+            load_student(model["path"], model["sha256"], int(level[1:]))
     with (directory / "input-identity.json").open("x") as f:
-        json.dump(dict(project=str(prepared_project), project_sha256=digest(prepared_project),
+        json.dump(dict(project=prepared_project["path"], project_sha256=prepared_project["sha256"], projects=projects,
             input_files=len(receipt["files"]), source_loading_job=receipt["job_id"],
             consolidated_sha256=receipt["source"]["sha256"],
             consolidated_time_s=receipt["source"]["final_frame"]["time"],
             mask_frames=len(rows), constrained=int(fixed.sum()),
             layout=read_json(directory / "records" / ("layout-%s.json" % source.name))), f, indent=2)
-    print("LIVE_OGS_INPUTS_VERIFIED", prepared_project, flush=True)
+    print("LIVE_OGS_INPUTS_VERIFIED", prepared_project["path"], flush=True)
 
 
 class LivePC:
@@ -118,7 +134,7 @@ class LivePC:
             for level, model in frozen["students"].items():
                 load_student(model["path"], model["sha256"], int(level[1:]))
             self.context.update({key:frozen[key] for key in ("students", "controls_p1", "controls_p2")})
-        elif method != "reference":
+        elif method not in ("reference", "amg"):
             raise ValueError("Unknown live method: " + method)
         self.active = None
         self.solve_count = 0
@@ -137,6 +153,9 @@ class LivePC:
             "KSPGetTolerances": [P, ptr(D), ptr(D), ptr(D), ptr(I)],
         }.items():
             bind(p, name, signature)
+        if self.method == "amg":
+            bind(p, "PCHYPREGetType", [P, ptr(C.c_char_p)])
+            bind(p, "PCView", [P, P])
         hook = C.CFUNCTYPE(I, P, P, P, P)
         self.pre_hook = hook(self.checked(self.before_solve))
         self.post_hook = hook(self.checked(self.after_solve))
@@ -179,29 +198,40 @@ class LivePC:
         p.call("KSPGetPC", ksp, C.byref(fs))
         p.call("KSPGetOperators", ksp, C.byref(full), C.byref(pre))
         p.call("PCSetUp", fs)
-        child, original, operator, k = self.replay.pcapply_child(p, fs, self.rows, expected_pc=b"none")
+        use_amg = self.method == "amg"
+        child, original, operator, k = self.replay.pcapply_child(
+            p, fs, self.rows, expected_pc=b"hypre" if use_amg else b"none")
         assert np.array_equal(ownership(p, k), self.layout["ownership"])
         csr, _ = local_csr(p, k, self.bridge)
         csr.eliminate_zeros()
         diagonal_only = (np.diff(csr.indptr) == 1) & (csr.diagonal(k=self.lo) == 1.)
         if p.maximum(float(np.any(self.fixed != diagonal_only))):
             raise ValueError("Live unit diagonal constraint rows differ from the verified source mask")
-        displacement = prepare_displacement(self.config, p, self.legacy, self.bridge, None,
-            k, self.layout, self.fields, self.cache, context=self.context)
-        if displacement.failure is not None:
-            raise ValueError("Live hierarchy failed: " + displacement.failure)
-        p.call("PetscObjectReference", original)
         self.times.clear()
-        shell, callback = self.replay.pcapply_shell(p, child, operator, k, displacement.apply, self.times)
+        if use_amg:
+            kind = C.c_char_p()
+            p.call("PCHYPREGetType", original, C.byref(kind))
+            assert kind.value == b"boomeramg", kind.value
+            hierarchy = dict(pc_type="hypre", amg_type=kind.value.decode(), displacement=None)
+        else:
+            displacement = prepare_displacement(self.config, p, self.legacy, self.bridge, None,
+                k, self.layout, self.fields, self.cache, context=self.context)
+            if displacement.failure is not None:
+                raise ValueError("Live hierarchy failed: " + displacement.failure)
+            p.call("PetscObjectReference", original)
+            shell, callback = self.replay.pcapply_shell(p, child, operator, k, displacement.apply, self.times)
+            hierarchy = dict(pc_type="shell", amg_type=None, displacement=displacement,
+                             child=child, original=original, shell=shell, callback=callback)
         build, work = p.vector(full), p.vector(full)
         true_limit = max(atol.value, rtol.value*p.norm(rhs))
         self.active = dict(full=full, rhs=rhs, build=build, work=work, limit=true_limit,
-            displacement=displacement, child=child, original=original, shell=shell, callback=callback,
-            start=start, cap=cap.value)
+                           start=start, cap=cap.value, **hierarchy)
         p.call("KSPSetConvergenceTest", ksp, C.cast(self.convergence, p.P), None, None)
         p.call("KSPSetUp", ksp)
         p.call("KSPSetUpOnBlocks", ksp)
         self.active["setup_s"] = p.maximum(time.perf_counter()-start)
+        if use_amg and self.solve_count == 0:
+            p.call("PCView", original, None)
 
     def residual(self, solution):
         p, state = self.p, self.active
@@ -225,23 +255,27 @@ class LivePC:
         p.call("KSPGetIterationNumber", ksp, C.byref(iterations))
         p.call("KSPGetConvergedReason", ksp, C.byref(reason))
         self.solve_count += 1
-        n = state["displacement"].numerical
-        pc_s = p.maximum(sum(self.times))
+        displacement = state["displacement"]
+        hierarchy = {}
+        if displacement is not None:
+            n = displacement.numerical
+            hierarchy = dict(pc_apply_s=p.maximum(sum(self.times)), pc_apply_count=len(self.times),
+                p1_nnz=n["level1"]["nnz"], k1_nnz=n.get("k1_nnz"), p2_nnz=n["level2"]["nnz"],
+                galerkin_max_error=max(n["galerkin_errors"]))
         if p.rank == 0:
             payload = json.dumps(dict(method=self.method, solve=self.solve_count,
                 iterations=iterations.value, reason=reason.value, residual=residual,
                 true_limit=state["limit"], elapsed_s=elapsed, setup_s=state["setup_s"],
-                pc_apply_s=pc_s, pc_apply_count=len(self.times), p1_nnz=n["level1"]["nnz"],
-                k1_nnz=n.get("k1_nnz"), p2_nnz=n["level2"]["nnz"],
-                galerkin_max_error=max(n["galerkin_errors"])), allow_nan=False)
+                pc_type=state["pc_type"], amg_type=state["amg_type"], **hierarchy), allow_nan=False)
             with self.solve_log.open("a") as log:
                 log.write(payload + "\n")
             print("LIVE_OGS_SOLVE", payload, flush=True)
         if not residual <= state["limit"] or reason.value <= 0:
             raise ValueError("Live TH2M GMRES failed the true residual check")
-        p.call("KSPSetPC", state["child"], state["original"])
-        p.destroy("PC", state["shell"], state["original"])
-        state["displacement"].close()
+        if displacement is not None:
+            p.call("KSPSetPC", state["child"], state["original"])
+            p.destroy("PC", state["shell"], state["original"])
+            displacement.close()
         p.destroy("Vec", state["build"], state["work"])
         self.active = None
 
@@ -251,11 +285,15 @@ def verify(config_path, directory):
     settings = config["live"]
     job = os.environ["SLURM_JOB_ID"]
     methods = {}
-    for method in ("reference", "student"):
+    for method in method_names(settings):
         solves = [json.loads(line) for line in (directory / ("solves-%s.jsonl" % method)).read_text().splitlines()]
-        assert solves and all(row["reason"] > 0 and row["residual"] <= row["true_limit"] and
-                              row["iterations"] <= config["max_iterations"] and
-                              row["galerkin_max_error"] <= 1e-9 for row in solves)
+        assert solves and all(row["method"] == method and row["reason"] > 0 and
+                              row["residual"] <= row["true_limit"] and
+                              row["iterations"] <= config["max_iterations"] for row in solves)
+        if method == "amg":
+            assert all(row["pc_type"] == "hypre" and row["amg_type"] == "boomeramg" for row in solves)
+        else:
+            assert all(row["galerkin_max_error"] <= 1e-9 for row in solves)
         result = Path(config["output_directory"]) / "data" / ("live-%s-%s" % (job, method))
         diagnostic, = result.glob("TH2MHYDRATE_*.jsonl")
         with diagnostic.open() as f:
@@ -281,8 +319,21 @@ def verify(config_path, directory):
             setup_seconds=sum(s["setup_s"] for s in solves),
             elapsed_seconds=float((directory / ("elapsed-%s.txt" % method)).read_text()),
             max_residual_over_limit=max(s["residual"]/s["true_limit"] for s in solves),
-            p1_nnz=sum(s["p1_nnz"] for s in solves), k1_nnz=sum(s["k1_nnz"] for s in solves),
-            p2_nnz=sum(s["p2_nnz"] for s in solves), output=str(result), final_pvtu=str(pvtu))
+            pc_type=solves[0]["pc_type"], amg_type=solves[0]["amg_type"],
+            output=str(result), final_pvtu=str(pvtu))
+        if method != "amg":
+            for key in ("p1_nnz", "k1_nnz", "p2_nnz"):
+                methods[method][key] = sum(row[key] for row in solves)
+        start = settings.get("injection_start_s")
+        if start is not None:
+            timed = [(row, solve) for row, solve in zip(native, solves) if row["t"] > start]
+            assert timed and any(t > start for t in accepted)
+            methods[method]["injection"] = dict(start_s=start, end_s=end,
+                accepted=sum(t > start for t in accepted),
+                rejected=sum(not row["accepted"] and row["t"] > start for row in decisions),
+                solves=len(timed), iterations=sum(row["iterations"] for row, _ in timed),
+                linear_seconds=sum(row["elapsed_seconds"] for row, _ in timed),
+                setup_seconds=sum(solve["setup_s"] for _, solve in timed))
     path = Path(config["output_directory"]) / "records" / ("student-live-%s.json" % job)
     with path.open("x") as f:
         json.dump(dict(job=job, end_s=settings["end_s"], ranks=settings["ranks"],

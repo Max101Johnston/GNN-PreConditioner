@@ -75,9 +75,13 @@ if [[ "$(cfg stage)" == "student_live" ]]; then
     singularity exec -B "$root" "$image" /opt/ogs/bin/python3 -B -m gnn_amg.live prepare "$config" "$work"
     binary_sha=$(singularity exec -B "$root" "$image" sha256sum /opt/ogs/bin/ogs | cut -d ' ' -f 1)
     [[ "$binary_sha" == "$(cfg live ogs_sha256)" ]]
-    printf '[run] OGS SHA256: %s; source case: %s; project: %s\n' "$binary_sha" "$PWD" "$work/3D-SCS-1st.prj"
+    printf '[run] OGS SHA256: %s; source case: %s\n' "$binary_sha" "$PWD"
     export SINGULARITYENV_OMPI_MCA_btl_tcp_if_include="$net" SINGULARITYENV_OMPI_MCA_oob_tcp_if_include="$net"
-    for method in reference student; do
+    read -r -a methods <<< "$(python3 -c 'import json,sys;print(" ".join(json.load(open(sys.argv[1]))["live"].get("methods",["reference","student"])))' "$config")"
+    for method in "${methods[@]}"; do
+        project="$work/3D-SCS-1st.prj"
+        if [[ "$method" == amg ]]; then project="$work/amg.prj"; fi
+        printf '[run] OGS method: %s; project: %s\n' "$method" "$project"
         output="$task/data/live-$SLURM_JOB_ID-$method"
         mkdir "$output"
         export SINGULARITYENV_GNN_LIVE_CONFIG="$config" SINGULARITYENV_GNN_LIVE_DIRECTORY="$work"
@@ -87,7 +91,7 @@ if [[ "$(cfg stage)" == "student_live" ]]; then
             mpirun --mca plm slurm --mca ras slurm --map-by slot --tag-output --bind-to core \
             --mca btl self,vader,tcp --mca btl_tcp_if_include "$net" -np "$SLURM_NTASKS" \
             singularity exec -B "$root" "$image" stdbuf -oL -eL /opt/ogs/bin/ogs \
-            -m "$PWD/input" -s "$source/src/gnn_amg" -o "$output" "$work/3D-SCS-1st.prj" < /dev/null
+            -m "$PWD/input" -s "$source/src/gnn_amg" -o "$output" "$project" < /dev/null
         python3 -c 'import sys; print(float(sys.argv[2])-float(sys.argv[1]))' "$start" "$(date +%s.%N)" \
             > "$work/elapsed-$method.txt"
     done
