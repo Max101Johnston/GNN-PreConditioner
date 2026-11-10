@@ -394,27 +394,56 @@ def fixed_action_value(p, legacy, bridge, displacement, model, probes):
 
 def audit_operator_gradient(p, legacy, bridge, displacement, model, probes, value, gradients, settings):
     epsilon = settings["finite_difference"]
+    multipliers = settings.get("context_fd_multipliers", (1.,)) if model.context_size else (1.,)
+    tolerance = settings["finite_tolerance"]
     center = fixed_action_value(p,legacy,bridge,displacement,model,probes)
     checks = []
+    stable = True
     for level,gradient in enumerate(gradients):
+        if model.context_size:
+            gradient = gradient.copy()
+            gradient[:-model.context_size] = 0.
         norm = float(np.linalg.norm(gradient))
         if not np.isfinite(norm) or norm<=1e-12:
             raise ValueError("The coefficient encoder lacks a usable level gradient")
         direction = gradient/norm
-        results = []
-        for sign in (-1,1):
-            shifted = model.coefficient_weights.copy()
-            shifted[level] = (shifted[level]+sign*epsilon*direction).astype(shifted.dtype)
-            trial = FactorModel(model.width,model.weights,model.adapters,model.unit_sum_depth,shifted)
-            results.append(fixed_action_value(p,legacy,bridge,displacement,trial,probes))
-        finite = (results[1]-results[0])/(2*epsilon)
-        error = abs(finite-norm)/max(abs(finite),norm)
-        checks.append(dict(level=level+1,analytic=norm,finite=finite,relative_error=error))
+        measurements = []
+        for multiplier in multipliers:
+            step = epsilon*multiplier
+            results = []
+            for sign in (-1,1):
+                shifted = model.coefficient_weights.copy()
+                shifted[level] = (shifted[level]+sign*step*direction).astype(shifted.dtype)
+                trial = replace(model, coefficient_weights=shifted)
+                results.append(fixed_action_value(p,legacy,bridge,displacement,trial,probes))
+            finite = (results[1]-results[0])/(2*step)
+            error = abs(finite-norm)/max(abs(finite),norm)
+            measurements.append(dict(step=step, finite=finite, relative_error=error,
+                                     minus=results[0], plus=results[1]))
+        selected = measurements[0]
+        window = None
+        if len(measurements)>1:
+            # Require a neighboring pair of resolved slopes. A single match
+            # can be caused by roundoff or by using too large a perturbation.
+            for low,high in zip(measurements,measurements[1:]):
+                a,b = low["finite"],high["finite"]
+                agreement = abs(a-b)/max(abs(a),abs(b),norm)
+                if max(low["relative_error"],high["relative_error"])<tolerance and agreement<tolerance/2:
+                    window = dict(steps=[low["step"],high["step"]], relative_difference=agreement)
+                    selected = low
+                    break
+            stable = stable and window is not None
+        row = dict(level=level+1, analytic=norm, finite=selected["finite"],
+                   relative_error=selected["relative_error"])
+        if len(measurements)>1:
+            row.update(step_measurements=measurements, stable_window=window)
+        checks.append(row)
     center_error = abs(center-value)/max(1.,abs(value))
     return dict(center=center,center_relative_error=center_error,levels=checks,
-                passed=bool(center_error<settings["center_tolerance"] and
-                            all(row["relative_error"]<settings["finite_tolerance"] for row in checks)),
-                scope="Executed factors, Galerkin products and coarse solves on fixed decoded feature tapes.")
+                passed=bool(stable and center_error<settings["center_tolerance"] and
+                            all(row["relative_error"]<tolerance for row in checks)),
+                scope="Executed factors, Galerkin products and coarse solves on fixed decoded feature tapes.",
+                parameter_scope="candidate_context" if model.context_size else "coefficient_network")
 
 
 def operator_observation(p, legacy, bridge, displacement, model, probes, gradient, settings,

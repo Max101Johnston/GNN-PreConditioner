@@ -503,3 +503,24 @@ PCApply inputs to the existing archive and keeps the structural weights.
 New checkpoints are ranked by paired cold-start time at the same residual
 threshold on separate diagnostic frames. Only a changed candidate reaches
 the fixed eight validation frames in two alternating orders.
+
+### Frozen evaluation and candidate attention
+
+`student_cycle=factor_final` evaluates the frozen generator, signed student,
+and on-the-spot BoomerAMG on every test state. Methods share a matrix, true
+residual threshold and MPI world. The second repeat reverses the order.
+Any existing retained hierarchy is evaluated as a separate cached control.
+
+`student_cycle=factor_attention` compares a masked candidate attention
+summary with a residual feed-forward summary of the same parameter count.
+The attention query depends on the fine row and scores the existing
+edge embeddings. The support decoder and signed coefficient outputs remain
+separate from the attention weights. Both variants reproduce the mean
+summary at initialization and verify added-parameter derivatives through
+the actual Galerkin cycle. The audit can require two adjacent step sizes
+to agree within half the derivative tolerance and independently meet the
+full tolerance. The report retains every measured slope.
+Both variants use the same probe archive, update schedule
+and independent diagnostic frames. The fixed eight-frame comparison runs
+only after the attention variant passes both diagnostic timing repeats.
+The test split is reserved for the frozen evaluation.

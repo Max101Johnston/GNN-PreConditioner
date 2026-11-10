@@ -128,6 +128,46 @@ def coefficients(logit, correction, keep, same, unit_row_sum=False):
     return keep * (base + signed)
 
 
+
+def candidate_context(kind, parameters, fine, hidden, valid):
+    """Pool an existing candidate row. Weights here never become interpolation."""
+    count = np.maximum(valid.sum(1, keepdims=True), 1)
+    mean = ((hidden * valid[:, :, None]).sum(1) / count).astype(np.float32)
+    if parameters is None:
+        return mean, None
+    query = fine * parameters[0] + parameters[1]
+    if kind == "attention":
+        score = np.einsum("nkd,nd->nk", hidden, query)
+        peak = np.max(np.where(valid, score, -np.inf), axis=1, keepdims=True, initial=-np.inf)
+        weights = np.exp(np.where(valid, score - np.where(np.isfinite(peak), peak, 0.), -np.inf))
+        weights /= np.maximum(weights.sum(1, keepdims=True), 1.)
+        uniform = valid.astype(weights.dtype) / count.astype(weights.dtype)
+        # Uniform scores reproduce the old mean, including its rounding.
+        delta = np.einsum("nk,nkd->nd", weights-uniform, hidden)
+        return mean+delta, (query, weights)
+    activation = np.tanh(mean+fine)*valid.any(1, keepdims=True)
+    return mean+query*activation, (query, activation)
+
+
+def candidate_context_pullback(kind, parameters, fine, hidden, valid, cache, derivative):
+    query, auxiliary = cache
+    if kind == "attention":
+        attention = auxiliary
+        aligned = np.einsum("nkd,nd->nk", hidden, derivative)
+        score = attention * (aligned - (attention*aligned).sum(1, keepdims=True))
+        d_query = np.einsum("nk,nkd->nd", score, hidden)
+        d_hidden = attention[:, :, None]*derivative[:, None, :] + score[:, :, None]*query[:, None, :]
+        d_fine = d_query * parameters[0]
+    else:
+        d_query = derivative * auxiliary
+        d_activation = derivative * query * (1.-auxiliary**2) * valid.any(1, keepdims=True)
+        d_mean = (derivative+d_activation)/np.maximum(valid.sum(1, keepdims=True), 1)
+        d_hidden = valid[:, :, None]*d_mean[:, None, :]
+        d_fine = d_query*parameters[0] + d_activation
+    d_parameters = np.stack(((d_query*fine).sum(0), d_query.sum(0)))
+    return d_hidden, d_fine, d_parameters
+
+
 @dataclass
 class FactorModel:
     width: int
@@ -136,6 +176,8 @@ class FactorModel:
     unit_sum_depth: int = 0
     coefficient_weights: np.ndarray = None
     product_compression: np.ndarray = None
+    context_kind: str = "mean"
+    context_parameters: np.ndarray = None
 
     def __post_init__(self):
         self.layers = []
@@ -156,13 +198,28 @@ class FactorModel:
                 self.product_compression.shape != (PRODUCT_SUPPORT_FEATURES + PRODUCT_BUDGET_FEATURES,)
                 or not np.isfinite(self.product_compression).all()):
             raise ValueError("Invalid P1 support and budget parameters")
+        if self.context_kind not in ("mean", "attention", "capacity"):
+            raise ValueError("Unknown candidate context")
         self.coefficient_networks = None
         if self.coefficient_weights is not None:
-            if self.coefficient_weights.shape != (len(DEPTHS), self.weights.size):
+            if self.context_parameters is not None or self.coefficient_weights.shape != (
+                    len(DEPTHS), self.weights.size+self.context_size):
                 raise ValueError("Invalid independent coefficient network dimensions")
-            self.coefficient_networks = tuple(
-                FactorModel(self.width, weights, self.adapters, self.unit_sum_depth)
-                for weights in self.coefficient_weights)
+            self.coefficient_networks = tuple(FactorModel(
+                self.width, weights[:self.weights.size], self.adapters, self.unit_sum_depth,
+                context_kind=self.context_kind,
+                context_parameters=weights[self.weights.size:].reshape(2,self.width)
+                    if self.context_size else None) for weights in self.coefficient_weights)
+        elif self.context_size:
+            if (self.context_parameters is None or self.context_parameters.shape != (2,self.width)
+                    or not np.isfinite(self.context_parameters).all()):
+                raise ValueError("Invalid candidate context parameters")
+        elif self.context_parameters is not None:
+            raise ValueError("Mean context has no parameters")
+
+    @property
+    def context_size(self):
+        return 0 if self.context_kind == "mean" else 2*self.width
 
     def coefficients_at(self, stage):
         if self.coefficient_networks is None:
@@ -186,8 +243,8 @@ class FactorModel:
         w = self.width
         hidden = np.maximum(0, (fine @ weight[:, :w].T)[:, None, :] +
             coarse @ weight[:, w:2*w].T + edges @ weight[:, 2*w:].T + bias)
-        summary = (hidden * valid[:, :, None]).sum(1) / np.maximum(valid.sum(1)[:, None], 1)
-        summary = summary.astype(np.float32)
+        summary, context_tape = candidate_context(
+            self.context_kind, self.context_parameters, fine, hidden, valid)
         weight, bias = self.layers[3]
         row_context = summary @ weight[:, w:].T
         if keep is not None:
@@ -204,6 +261,8 @@ class FactorModel:
         refined = np.maximum(0, hidden @ weight[:, :w].T + row_context[:, None, :] + bias)
         if tape is not None:
             tape.extend((hidden, summary, refined))
+            if context_tape is not None:
+                tape.append(context_tape)
         out = self.linear(4, refined)
         quota = self.linear(5, np.column_stack((fine, summary))).ravel()
         adapter = self.adapters[stage, regions]
@@ -220,6 +279,10 @@ def save_model(path, model):
         params["coefficient_weights"] = model.coefficient_weights
     if model.product_compression is not None:
         params["product_compression"] = model.product_compression
+    if model.context_kind != "mean":
+        params["context_kind"] = model.context_kind
+    if model.context_parameters is not None:
+        params["context_parameters"] = model.context_parameters
     with Path(path).open("xb") as stream:
         np.savez(stream, **params)
     return dict(path=str(path), sha256=digest(path))
@@ -232,7 +295,10 @@ def load_model(receipt):
         depth = int(f["unit_sum_depth"]) if "unit_sum_depth" in f.files else 0
         coeff = f["coefficient_weights"] if "coefficient_weights" in f.files else None
         compression = f["product_compression"] if "product_compression" in f.files else None
-        return FactorModel(int(f["width"]), f["weights"], f["adapters"], depth, coeff, compression)
+        kind = f["context_kind"].item() if "context_kind" in f.files else "mean"
+        parameters = f["context_parameters"] if "context_parameters" in f.files else None
+        return FactorModel(int(f["width"]), f["weights"], f["adapters"], depth, coeff, compression,
+                           kind, parameters)
 
 
 @dataclass
@@ -508,7 +574,6 @@ class FixedFactor:
     def backward(self, p, model, grad):
         tape = []
         out, fine, coarse, x, x_coarse, anchors, inverse = self.network(p, model, tape)
-        hidden, summary, refined = tape
         rr, cc = np.nonzero(self.keep)
         grad_csr = sparse.csr_matrix((grad, self.csr.indices, self.csr.indptr), shape=self.csr.shape)
         values = np.zeros(self.keep.shape)
@@ -521,23 +586,26 @@ class FixedFactor:
             values -= (values.sum(1, keepdims=True) / np.maximum(self.keep.sum(1, keepdims=True), 1))
         signed = self.keep * .75 * (1 - np.tanh(out[:, :, 2])**2) * values
         derivative = np.stack((np.zeros_like(logit), logit, signed), axis=2)
+        d_context = []
         gradients, d_fine, d_coarse = edge_pullback(model, fine, coarse, self.edges,
-                                                   self.valid, tape, derivative)
+            self.valid, tape, derivative, context_gradients=d_context)
         d_fine *= fine > 0
         d_anchors = np.zeros(anchors.shape)
         np.add.at(d_anchors, inverse, d_coarse[self.valid])
         d_anchors *= anchors > 0
         gradients[0] = d_fine.T @ x + d_anchors.T @ x_coarse, d_fine.sum(0) + d_anchors.sum(0)
-        return packed_gradient(gradients)
+        weights = packed_gradient(gradients)
+        return np.r_[weights, d_context[0].ravel()] if d_context else weights
 
 
 def packed_gradient(gradients):
     return np.concatenate([part.ravel() for group in gradients for part in group])
 
 
-def edge_pullback(model, fine, coarse, edges, valid, tape, derivative, quota_derivative=None):
+def edge_pullback(model, fine, coarse, edges, valid, tape, derivative, quota_derivative=None,
+                  context_gradients=None):
     """Reverse the edge encoder and its masked row summary for either head."""
-    hidden, summary, refined = tape
+    hidden, summary, refined = tape[:3]
     gradients = [(np.zeros(w.shape), np.zeros(b.shape)) for w, b in model.layers]
     width = model.width
     output = derivative.reshape((-1, 3))
@@ -554,8 +622,16 @@ def edge_pullback(model, fine, coarse, edges, valid, tape, derivative, quota_der
                         np.array([quota_derivative.sum()]))
         d_fine = quota_derivative[:, None] * model.layers[5][0][0, :width]
         d_summary += quota_derivative[:, None] * model.layers[5][0][0, width:]
-    d_summary /= np.maximum(valid.sum(1, keepdims=True), 1)
-    d_hidden = (d_refined @ left + valid[:, :, None]*d_summary[:, None, :]) * (hidden > 0)
+    if len(tape) == 3:
+        d_summary /= np.maximum(valid.sum(1, keepdims=True), 1)
+        pooled = valid[:, :, None]*d_summary[:, None, :]
+    else:
+        pooled, d_query, d_parameters = candidate_context_pullback(
+            model.context_kind, model.context_parameters, fine, hidden, valid, tape[3], d_summary)
+        d_fine = d_fine + d_query
+        if context_gradients is not None:
+            context_gradients.append(d_parameters)
+    d_hidden = (d_refined @ left + pooled) * (hidden > 0)
     flat = d_hidden.reshape((-1, width))
     grad_fine = d_hidden.sum(1)
     gradients[2] = (np.column_stack((grad_fine.T @ fine,
@@ -606,7 +682,7 @@ def factor_cotangent(p, legacy, bridge, level, transfer_gradient, model):
         if len(fixed) == 3:
             suffix_product = multiply(p, factors[1], factors[2])
             suffixes.insert(0, local_csr(p, suffix_product, bridge)[0])
-        gradient = np.zeros(model.weights.shape, np.float64)
+        gradient = np.zeros(model.weights.size+model.context_size, np.float64)
         compression = getattr(level, "compression_tape", None)
         local = transfer_gradient if compression is None else compression.pullback(transfer_gradient)
         for j, (tape, suffix) in enumerate(zip(fixed, suffixes)):

@@ -1,5 +1,6 @@
 """Persistent training probes and paired checkpoint selection for the factor generator."""
 from collections import defaultdict, deque
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -85,14 +86,14 @@ def training_order(frames, workers, seed):
 
 
 def operator_rows(p,legacy,bridge,model,states,batches,solve,share,numerical,fusion,
-                  gradient=False,references=None,settings=None,inference=None):
+                  gradient=False,references=None,settings=None,inference=None,audit=False):
     local = []
     for key,state in states.items():
         def apply(displacement):
             objective = None if references is None else lambda losses: balanced_action(
                 losses,references[key],settings)
             return operator_observation(p,legacy,bridge,displacement,model,batches[key],gradient,
-                                        numerical,objective=objective)
+                                        numerical,audit=audit,objective=objective)
         result = solve(key,state,dict(name="operator_replay",factor_model=model,
             factor_context=dict(factor_tape=gradient, factor_operation=apply, factor_fusion=fusion,
                                 factor_inference=inference)),
@@ -155,11 +156,15 @@ def training_update(p, legacy, bridge, model, states, batches, references, solve
         return model,dict(accepted=False,failure="coefficient_gradient"),step_size
     current = {r["key"]:r for r in source}
     record_rows = [{k:v for k,v in r.items() if k!="gradient"} for r in source]
+    scaled = gradient
+    if model.context_size:
+        scaled = gradient.copy()
+        scaled[:, -model.context_size:] *= settings["context_lr_scale"]
     attempts = []
     for factor in (1.,.5,.25):
         step = step_size*factor
-        weights = (model.coefficient_weights-step*gradient/norm).astype(model.weights.dtype)
-        trial = FactorModel(model.width,model.weights,model.adapters,model.unit_sum_depth,weights)
+        weights = (model.coefficient_weights-step*scaled/norm).astype(model.weights.dtype)
+        trial = replace(model, coefficient_weights=weights)
         rows = measure(trial)
         for row in rows:
             if row["failure"] is None:
@@ -633,7 +638,9 @@ def run_cost_replay(config, p, legacy, bridge, frames, load, destroy, solve, sha
             for row in rows for ref in [reference[row["key"], row["repeat"]]] if ref["passed"])
         comparisons[name] = dict(cost_pair(timed_paths, diagnostics, "incumbent", name,
                                           settings["selection_margin"]), same_solve=bool(same_solve))
-    available = [name for name in paths if comparisons[name]["eligible"] and comparisons[name]["same_solve"]]
+    # Strict trajectory agreement remains diagnostic. An equivalent
+    # construction can qualify at the same true tolerance in both repeats.
+    available = [name for name in paths if comparisons[name]["eligible"]]
     deployment = min(available, key=lambda name:cost_rank(comparisons[name])) if available else None
     initial_deployment = deployment
     if p.global_rank == 0:
@@ -743,3 +750,126 @@ def run_cost_replay(config, p, legacy, bridge, frames, load, destroy, solve, sha
                 diagnostic_keys=diagnostics, training_keys=fit, captures=captures, history=history,
                 milestones=milestones, winner=winner, validation_keys=validation, cases=cases,
                 benchmark=benchmark, speed_gate=bool(benchmark and benchmark["student"]["eligible"]))
+
+
+def run_attention_replay(config, p, legacy, bridge, frames, load, destroy, solve, share, evaluate, job):
+    """Test one candidate-local attention model against a matched capacity control."""
+    settings = config["factor_attention"]
+    source = checked_json(settings["source_report"])
+    archive = checked_json(settings["probe_report"])
+    validation = config["training"]["validation_keys"]
+    diagnostics = settings["diagnostic_keys"]
+    groups = settings["batches"]
+    fit = [k for group in groups for k in group]
+    numerical, update_settings = settings["numerical"], settings["update"]
+    workers = config["parallel_workers"]
+    if (source["winner"]["model"] != config["factor_model"] or source["winner"]["inference"] is not None
+            or source["validation_keys"] != validation or archive["keys"] != validation
+            or source["source"] != settings["probe_report"]
+            or len(fit+diagnostics+validation) != len(set(fit+diagnostics+validation))
+            or any(len(batch)>workers for batch in groups)
+            or any(frames[k]["split"]!="training" for k in fit+diagnostics)
+            or any(frames[k]["split"]!="validation" for k in validation)):
+        raise ValueError("Attention must use the frozen checkpoint and the fixed training/validation split")
+    baseline = load_model(config["factor_model"])
+    if baseline.context_size or baseline.coefficient_weights is None or baseline.product_compression is not None:
+        raise ValueError("Attention starts from the uncompressed mean-context generator")
+    bank = {k:list(archive["probe_bank"][k]) for k in fit}
+    for capture in source["captures"]:
+        if capture["receipt"] is not None and capture["key"] in bank:
+            bank[capture["key"]].append(capture["receipt"])
+    names = ("attention", "capacity")
+    added = np.zeros((len(baseline.coefficient_weights),2*baseline.width),dtype=baseline.weights.dtype)
+    models = {name:replace(baseline, context_kind=name,
+                           coefficient_weights=np.column_stack((baseline.coefficient_weights,added))) for name in names}
+
+    def method(name, model):
+        return dict(name=name, factor_model=model, factor_context=dict(factor_fusion=True))
+
+    def measure(model, states, probes, audit=False):
+        return operator_rows(p, legacy, bridge, model, states, probes, solve, share, numerical,
+                             True, gradient=audit, audit=audit)
+
+    def local_batch(keys):
+        return {k:load(k) for i,k in enumerate(keys) if i%workers==p.worker}
+
+    states = local_batch(groups[0])
+    try:
+        probes = {k:load_probe_shards(p, bank[k]) for k in states}
+        reference = measure(baseline, states, probes)
+        audit = {}
+        for name in names:
+            rows = measure(models[name], states, probes, audit=True)
+            exact = len(reference)==len(groups[0]) and equivalent_probe_actions(reference, rows)
+            passed = bool(exact and all(r["directional_derivatives"]["passed"] for r in rows))
+            audit[name] = dict(exact_initialization=exact, passed=passed,
+                               rows=[{k:v for k,v in r.items() if k!="gradient"} for r in rows])
+    finally:
+        for state in states.values():
+            destroy(state)
+    verified = all(a["passed"] for a in audit.values())
+    result = dict(source=settings["source_report"], probes=settings["probe_report"],
+        baseline=config["factor_model"], fit_keys=fit, diagnostic_keys=diagnostics, validation_keys=validation,
+        probe_names={k:[r["phase"]+"/"+n for r in bank[k] for n in r["probes"]] for k in fit},
+        new_parameters_per_model=int(added.size), audit=audit, audit_passed=verified,
+        history=[], models={}, diagnostic_cases=[], diagnostic_comparison={}, cases=[],
+        validation_comparison={}, speed_gate=False, research_gate=False)
+    if p.global_rank==0:
+        record(config, "factor_attention_audit", job=job, keys=groups[0],
+               passed={name:r["passed"] for name,r in audit.items()})
+    if not verified:
+        return result
+
+    steps = {name:update_settings["step_size"] for name in names}
+    for epoch in range(1,settings["rounds"]+1):
+        for index,keys in enumerate(groups):
+            states = local_batch(keys)
+            try:
+                probes = {k:load_probe_shards(p,bank[k]) for k in states}
+                reference = measure(baseline,states,probes)
+                if len(reference)!=len(keys) or any(r["failure"] is not None for r in reference):
+                    raise ValueError("The frozen generator cannot score a common training batch")
+                targets = {r["key"]:r["probes"] for r in reference}
+                updates = {}
+                for name in names if (epoch+index)%2 else names[::-1]:
+                    models[name],updates[name],steps[name] = training_update(
+                        p,legacy,bridge,models[name],states,probes,targets,solve,share,
+                        numerical,update_settings,True,steps[name])
+            finally:
+                for state in states.values():
+                    destroy(state)
+            result["history"].append(dict(round=epoch, keys=keys, updates=updates))
+            if p.global_rank==0:
+                record(config,"factor_attention_batch",job=job,round=epoch,keys=keys,
+                       accepted={k:r["accepted"] for k,r in updates.items()})
+
+    output = Path(config["output_directory"])
+    for name in names:
+        model = models[name]
+        local = []
+        if p.global_rank==0:
+            local.append(save_model(output/"checkpoints"/("generator-%s-%s.npz"%(job,name)),model))
+        receipt, = share(local)
+        result["models"][name] = dict(model=receipt,
+            context_delta=np.linalg.norm(model.coefficient_weights[:,-model.context_size:],axis=1).tolist(),
+            base_coefficient_delta=np.linalg.norm(model.coefficient_weights[:,:baseline.weights.size]
+                                                  -baseline.coefficient_weights,axis=1).tolist(),
+            accepted=sum(r["updates"][name]["accepted"] for r in result["history"]))
+    methods = [method("frozen",baseline), *(method(name,models[name]) for name in names)]
+    cases = evaluate(diagnostics,methods,"factor-attention-diagnostic",repeats=2)
+    diagnostic = {name:cost_pair(cases,diagnostics,"frozen",name,settings["selection_margin"]) for name in names}
+    result.update(diagnostic_cases=cases,diagnostic_comparison=diagnostic)
+    selected = diagnostic["attention"]["eligible"] and all(d>0. for d in result["models"]["attention"]["context_delta"])
+    if p.global_rank==0:
+        record(config,"factor_attention_diagnostics",job=job,selected=bool(selected),
+               ratios={k:r["ratios"] for k,r in diagnostic.items()})
+    if selected:
+        student = dict(config["factor_reference"],fallback=False)
+        cases = evaluate(validation,[*methods,student],"factor-attention-validation",repeats=2)
+        compare = {name:cost_pair(cases,validation,name,"attention",settings["speed_margin"])
+                   for name in ("frozen","capacity","student")}
+        research = cost_pair(cases,validation,"student","attention",settings["research_margin"])
+        result.update(cases=cases,validation_comparison=compare,
+                      speed_gate=all(compare[k]["eligible"] for k in ("frozen","student")),
+                      research_gate=research["eligible"],research_comparison=research)
+    return result

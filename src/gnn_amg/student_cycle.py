@@ -759,6 +759,37 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
                        and row["operator"]["total_s"]<=limit*row["student"]["total_s"] for row in repeats)
         report.update(model=config["factor_model"],keys=keys,cases=cases,repeat_totals=repeats,
                       totals=method_totals(cases),speed_gate=compared(.98),compression_gate=compared(1.05))
+    elif mode == "factor_final":
+        from .factor_operator import checked_json
+        from .factor_replay import cost_pair
+        from .factorized import load_model
+
+        settings = config["factor_final"]
+        source = checked_json(settings["source_report"])
+        keys = settings["keys"]
+        if (source["winner"]["model"] != config["factor_model"] or source["winner"]["inference"] is not None
+                or len(keys) != len(set(keys)) or set(keys) != {k for k,r in frames.items() if r["split"]=="test"}):
+            raise ValueError("The final evaluation requires the frozen generator and the complete test split")
+        model = load_model(config["factor_model"])
+        methods = [dict(name="frozen", factor_model=model, factor_context=dict(factor_fusion=True)),
+                   dict(config["factor_reference"], fallback=False), dict(name="amg")]
+        cases = evaluate(keys, methods, "factor-final", repeats=2)
+        cached_keys = [key for key in keys if retained_teacher(config, frames[key]) is not None]
+        cached = evaluate(cached_keys, [dict(name="retained_base")], "factor-final-cached") if cached_keys else []
+        complete = {(r["repeat"], r["key"], r["method"]) for r in cases}
+        expected = {(i,k,m["name"]) for i in range(2) for k in keys for m in methods}
+        status = 0 if complete == expected and len(cases) == len(expected) else 2
+        comparisons = {name:cost_pair(cases, keys, name, "frozen", settings["speed_margin"])
+                       for name in ("student", "amg")}
+        report.update(source=settings["source_report"], model=config["factor_model"], keys=keys, cases=cases,
+                      totals=method_totals(cases), comparisons=comparisons,
+                      cached_teacher=dict(keys=cached_keys, cases=cached, totals=method_totals(cached)))
+    elif mode == "factor_attention":
+        from .factor_replay import run_attention_replay
+
+        result = run_attention_replay(config, p, legacy, bridge, frames, load, destroy, solve, share, evaluate, job)
+        report.update(result)
+        status = 0 if result["audit_passed"] else 2
     elif mode == "factor_cost":
         from .factor_replay import run_cost_replay
 

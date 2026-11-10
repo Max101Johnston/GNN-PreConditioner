@@ -86,6 +86,102 @@ class FactorizedTest(unittest.TestCase):
                                          unit_row_sum=True)
         np.testing.assert_allclose(no_own_component.sum(1), [1., 0.], atol=1e-15)
 
+    def test_attention_ranks_the_same_edges_differently_by_fine_row(self):
+        from gnn_amg.factorized import candidate_context
+
+        fine = np.array([[1., 0.], [0., 1.], [1., 1.]], dtype=np.float32)
+        hidden = np.broadcast_to([[1., 0.], [0., 1.], [30., 30.]], (3,3,2)).astype(np.float32)
+        valid = np.array([[True, True, False], [True, True, False], [False, False, False]])
+        parameters = np.array([[1., 1.], [0., 0.]], dtype=np.float32)
+        result, (_, weights) = candidate_context("attention", parameters, fine, hidden, valid)
+        self.assertGreater(weights[0,0], weights[0,1])
+        self.assertGreater(weights[1,1], weights[1,0])
+        self.assertTrue(np.all(weights[~valid] == 0.))
+        np.testing.assert_array_equal(result[2], [0.,0.])
+
+    def test_candidate_context_pullbacks_match_directional_derivatives(self):
+        from gnn_amg.factorized import candidate_context, candidate_context_pullback
+
+        rng = np.random.default_rng(91)
+        valid = np.array([[True, True, False], [False, True, False], [False, False, False]])
+        inputs = [rng.normal(0.,.25,shape).astype(np.float32)
+                  for shape in ((2,4), (3,4), (3,3,4))]
+        directions = [rng.normal(0.,.4,array.shape).astype(np.float32) for array in inputs]
+        upstream = rng.normal(0.,.3,(3,4)).astype(np.float32)
+        eps = .001
+        for kind in ("attention","capacity"):
+            with self.subTest(kind=kind):
+                center, tape = candidate_context(kind,*inputs,valid)
+                dh,df,dparams = candidate_context_pullback(kind,*inputs,valid,tape,upstream)
+                analytic = sum(np.sum(g*step) for g,step in zip((dparams,df,dh),directions))
+                args = [[v+sign*eps*step for v,step in zip(inputs,directions)] for sign in (-1,1)]
+                low,high = [candidate_context(kind,*a,valid)[0] for a in args]
+                finite = np.sum((high-low)*upstream)/(2*eps)
+                np.testing.assert_allclose(analytic,finite,rtol=.002,atol=2e-5)
+                np.testing.assert_array_equal(center[2],np.zeros(4))
+
+    def test_context_audit_requires_adjacent_accurate_slopes(self):
+        from unittest.mock import patch
+
+        from gnn_amg.factor_operator import audit_operator_gradient
+
+        width = 2
+        size = sum((a+1)*b for a,b in layer_sizes(width))
+        model = FactorModel(width, np.zeros(size), np.zeros((STAGES,REGIONS,6)),
+                           coefficient_weights=np.zeros((2,size+2*width)), context_kind="attention")
+        gradients = np.zeros_like(model.coefficient_weights)
+        gradients[:,size] = 1.
+        settings = dict(finite_difference=.002, finite_tolerance=.06, center_tolerance=.0002,
+                        context_fd_multipliers=[1.,2.,4.,8.])
+        steps = np.array([.002,.004,.008,.016])
+        for slopes,passed in [([.9145,.997,1.003,1.02],True), ([.91,.92,.92,.92],False),
+                              ([.91,1.001,.91,.91],False), ([.91,.95,1.05,.91],False)]:
+            with self.subTest(slopes=slopes):
+                def action(_p, _legacy, _bridge, _displacement, candidate, _probes):
+                    shift = candidate.coefficient_weights[:,size].sum()
+                    nearest = np.argmin(np.abs(steps-abs(shift)))
+                    return .37 + shift*slopes[nearest]
+                with patch("gnn_amg.factor_operator.fixed_action_value", side_effect=action):
+                    audit = audit_operator_gradient(None,None,None,None,model,None,.37,gradients,settings)
+                self.assertEqual(audit["passed"],passed)
+                for level in audit["levels"]:
+                    self.assertEqual(len(level["step_measurements"]),4)
+                    if passed:
+                        self.assertEqual(level["stable_window"]["steps"],[.004,.008])
+                        self.assertGreater(level["step_measurements"][0]["relative_error"],.06)
+                    else:
+                        self.assertIsNone(level["stable_window"])
+
+    def test_candidate_context_checkpoint_reproduces_mean_at_initialization(self):
+        from dataclasses import replace
+
+        rng = np.random.default_rng(12)
+        width = 4
+        size = sum((a+1)*b for a,b in layer_sizes(width))
+        weights = rng.normal(0.,.2,size).astype(np.float32)
+        base = FactorModel(width,weights,np.zeros((STAGES,REGIONS,6),np.float32),
+                           coefficient_weights=np.stack([weights,weights*.9]))
+        arguments = (rng.normal(size=(3,width)).astype(np.float32),
+                     rng.normal(size=(3,5,width)).astype(np.float32),
+                     rng.normal(size=(3,5,8)).astype(np.float32),
+                     np.array([[True, False, True, True, False], [True]*5, [False]*5]),
+                     0, np.array([0,1,2]))
+        directory = Path(tempfile.mkdtemp(prefix="factor-context-test-"))
+        for kind in ("attention","capacity"):
+            with self.subTest(kind=kind):
+                params = np.column_stack((base.coefficient_weights,np.zeros((2,2*width),np.float32)))
+                model = replace(base,context_kind=kind,coefficient_weights=params)
+                restored = load_model(save_model(directory/(kind+".npz"),model))
+                self.assertEqual(restored.context_kind,kind)
+                np.testing.assert_array_equal(restored.coefficient_weights,params)
+                for stage in (0,3):
+                    old = base.coefficients_at(stage).edge_outputs(*arguments)
+                    new = restored.coefficients_at(stage).edge_outputs(*arguments)
+                    for a,b in zip(old,new):
+                        np.testing.assert_array_equal(a,b)
+                for a,b in zip(base.edge_outputs(*arguments),restored.edge_outputs(*arguments)):
+                    np.testing.assert_array_equal(a,b)
+
     def test_compact_inference_keeps_the_original_row_context(self):
         from types import SimpleNamespace
 
