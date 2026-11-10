@@ -21,6 +21,8 @@ EDGE_FEATURES = 8
 STAGES = sum(DEPTHS)
 REGIONS = 8
 MAX_SUPPORT = 6
+PRODUCT_SUPPORT_FEATURES = 6
+PRODUCT_BUDGET_FEATURES = 10
 
 
 class InvalidFactorization(ValueError):
@@ -132,6 +134,8 @@ class FactorModel:
     weights: np.ndarray
     adapters: np.ndarray
     unit_sum_depth: int = 0
+    coefficient_weights: np.ndarray = None
+    product_compression: np.ndarray = None
 
     def __post_init__(self):
         self.layers = []
@@ -148,6 +152,23 @@ class FactorModel:
         if not np.isfinite(self.weights).all() or not np.isfinite(self.adapters).all():
             raise ValueError("Non-finite factorized model")
 
+        if self.product_compression is not None and (
+                self.product_compression.shape != (PRODUCT_SUPPORT_FEATURES + PRODUCT_BUDGET_FEATURES,)
+                or not np.isfinite(self.product_compression).all()):
+            raise ValueError("Invalid P1 support and budget parameters")
+        self.coefficient_networks = None
+        if self.coefficient_weights is not None:
+            if self.coefficient_weights.shape != (len(DEPTHS), self.weights.size):
+                raise ValueError("Invalid independent coefficient network dimensions")
+            self.coefficient_networks = tuple(
+                FactorModel(self.width, weights, self.adapters, self.unit_sum_depth)
+                for weights in self.coefficient_weights)
+
+    def coefficients_at(self, stage):
+        if self.coefficient_networks is None:
+            return self
+        return self.coefficient_networks[int(stage >= DEPTHS[0])]
+
     def linear(self, index, features):
         weight, bias = self.layers[index]
         return features @ weight.T + bias
@@ -160,7 +181,7 @@ class FactorModel:
         logits[:, 1] += adapter[:, 1]
         return hidden, logits
 
-    def edge_outputs(self, fine, coarse, edges, valid, stage, regions, tape=None):
+    def edge_outputs(self, fine, coarse, edges, valid, stage, regions, tape=None, keep=None):
         weight, bias = self.layers[2]
         w = self.width
         hidden = np.maximum(0, (fine @ weight[:, :w].T)[:, None, :] +
@@ -168,7 +189,19 @@ class FactorModel:
         summary = (hidden * valid[:, :, None]).sum(1) / np.maximum(valid.sum(1)[:, None], 1)
         summary = summary.astype(np.float32)
         weight, bias = self.layers[3]
-        refined = np.maximum(0, hidden @ weight[:, :w].T + (summary @ weight[:, w:].T)[:, None, :] + bias)
+        row_context = summary @ weight[:, w:].T
+        if keep is not None:
+            # All candidates still contribute to the row context. Only the
+            # executed coefficients need the final refinement and output head.
+            rows, slots = np.nonzero(keep)
+            refined = np.maximum(0, hidden[rows, slots] @ weight[:, :w].T + row_context[rows] + bias)
+            retained = self.linear(4, refined)
+            retained[:, 2] += self.adapters[stage, regions[rows], 4] * (
+                edges[rows, slots, 1] + edges[rows, slots, 2] - .5)
+            outputs = np.zeros((*keep.shape, 3), dtype=retained.dtype)
+            outputs[rows, slots] = retained
+            return outputs, None
+        refined = np.maximum(0, hidden @ weight[:, :w].T + row_context[:, None, :] + bias)
         if tape is not None:
             tape.extend((hidden, summary, refined))
         out = self.linear(4, refined)
@@ -181,9 +214,14 @@ class FactorModel:
 
 
 def save_model(path, model):
+    params = dict(width=model.width, weights=model.weights, adapters=model.adapters,
+                  unit_sum_depth=model.unit_sum_depth)
+    if model.coefficient_weights is not None:
+        params["coefficient_weights"] = model.coefficient_weights
+    if model.product_compression is not None:
+        params["product_compression"] = model.product_compression
     with Path(path).open("xb") as stream:
-        np.savez(stream, width=model.width, weights=model.weights, adapters=model.adapters,
-                 unit_sum_depth=model.unit_sum_depth)
+        np.savez(stream, **params)
     return dict(path=str(path), sha256=digest(path))
 
 
@@ -192,7 +230,9 @@ def load_model(receipt):
         raise ValueError("Factorized checkpoint changed")
     with np.load(receipt["path"]) as f:
         depth = int(f["unit_sum_depth"]) if "unit_sum_depth" in f.files else 0
-        return FactorModel(int(f["width"]), f["weights"], f["adapters"], depth)
+        coeff = f["coefficient_weights"] if "coefficient_weights" in f.files else None
+        compression = f["product_compression"] if "product_compression" in f.files else None
+        return FactorModel(int(f["width"]), f["weights"], f["adapters"], depth, coeff, compression)
 
 
 @dataclass
@@ -355,7 +395,7 @@ def candidates(config, p, graph, selected, owners, coordinates, stage):
     return np.column_stack((geo, extra)), assignment, spacing, contacts, native
 
 
-def edge_features(graph, columns, rows, spacing, contacts, native, coordinates):
+def edge_features(graph, columns, rows, spacing, contacts, native, coordinates, packed=False):
     valid = columns >= 0
     ids = native[np.maximum(columns, 0)]
     distance = np.linalg.norm(coordinates[ids // 3] - graph.xyz[rows, None, :], axis=2)
@@ -366,6 +406,16 @@ def edge_features(graph, columns, rows, spacing, contacts, native, coordinates):
     rr, cc = np.where(valid)
     if len(rr):
         signed[rr, cc] = np.asarray(contacts[rows[rr], columns[rr, cc]]).ravel()
+    if packed:
+        features = np.empty((*columns.shape, EDGE_FEATURES), dtype=np.float32)
+        features[:, :, 0] = distance
+        features[:, :, 1] = np.arcsinh(12 * signed)
+        features[:, :, 2] = same
+        features[:, :, 3] = 1 / (.25 + distance**2)
+        features[:, :, 4:7] = np.eye(3, dtype=np.float32)[components]
+        features[:, :, 7] = np.abs(signed)
+        features *= valid[:, :, None]
+        return features, same
     features = np.concatenate((distance[:, :, None], np.arcsinh(12 * signed)[:, :, None],
         same[:, :, None], (1 / (.25 + distance**2))[:, :, None],
         np.eye(3)[components], np.abs(signed)[:, :, None]), axis=2)
@@ -471,31 +521,48 @@ class FixedFactor:
             values -= (values.sum(1, keepdims=True) / np.maximum(self.keep.sum(1, keepdims=True), 1))
         signed = self.keep * .75 * (1 - np.tanh(out[:, :, 2])**2) * values
         derivative = np.stack((np.zeros_like(logit), logit, signed), axis=2)
-        gradients = [(np.zeros(w.shape), np.zeros(b.shape)) for w, b in model.layers]
-        width = model.width
-
-        output = derivative.reshape((-1, 3))
-        gradients[4] = output.T @ refined.reshape((-1, width)), output.sum(0)
-        d_refined = (derivative @ model.layers[4][0]) * (refined > 0)
-        sums = d_refined.sum(1)
-        gradients[3] = (np.column_stack((d_refined.reshape((-1, width)).T @ hidden.reshape((-1, width)),
-                                        sums.T @ summary)), sums.sum(0))
-        left, right = np.hsplit(model.layers[3][0], 2)
-        d_hidden = d_refined @ left
-        d_summary = (sums @ right) / np.maximum(self.valid.sum(1, keepdims=True), 1)
-        d_hidden = (d_hidden + self.valid[:, :, None]*d_summary[:, None, :]) * (hidden > 0)
-        flat = d_hidden.reshape((-1, width))
-        grad_fine = d_hidden.sum(1)
-        gradients[2] = (np.column_stack((grad_fine.T @ fine,
-                         flat.T @ coarse.reshape((-1, width)),
-                         flat.T @ self.edges.reshape((-1, EDGE_FEATURES)))), grad_fine.sum(0))
-        left, middle, _ = np.split(model.layers[2][0], [width, 2*width], axis=1)
-        d_fine = (grad_fine @ left) * (fine > 0)
+        gradients, d_fine, d_coarse = edge_pullback(model, fine, coarse, self.edges,
+                                                   self.valid, tape, derivative)
+        d_fine *= fine > 0
         d_anchors = np.zeros(anchors.shape)
-        np.add.at(d_anchors, inverse, d_hidden[self.valid] @ middle)
+        np.add.at(d_anchors, inverse, d_coarse[self.valid])
         d_anchors *= anchors > 0
         gradients[0] = d_fine.T @ x + d_anchors.T @ x_coarse, d_fine.sum(0) + d_anchors.sum(0)
-        return np.concatenate([part.ravel() for group in gradients for part in group])
+        return packed_gradient(gradients)
+
+
+def packed_gradient(gradients):
+    return np.concatenate([part.ravel() for group in gradients for part in group])
+
+
+def edge_pullback(model, fine, coarse, edges, valid, tape, derivative, quota_derivative=None):
+    """Reverse the edge encoder and its masked row summary for either head."""
+    hidden, summary, refined = tape
+    gradients = [(np.zeros(w.shape), np.zeros(b.shape)) for w, b in model.layers]
+    width = model.width
+    output = derivative.reshape((-1, 3))
+    gradients[4] = output.T @ refined.reshape((-1, width)), output.sum(0)
+    d_refined = (derivative @ model.layers[4][0]) * (refined > 0)
+    sums = d_refined.sum(1)
+    gradients[3] = (np.column_stack((d_refined.reshape((-1, width)).T @ hidden.reshape((-1, width)),
+                                    sums.T @ summary)), sums.sum(0))
+    left, right = np.hsplit(model.layers[3][0], 2)
+    d_summary = sums @ right
+    d_fine = 0.
+    if quota_derivative is not None:
+        gradients[5] = (quota_derivative[None, :] @ np.column_stack((fine, summary)),
+                        np.array([quota_derivative.sum()]))
+        d_fine = quota_derivative[:, None] * model.layers[5][0][0, :width]
+        d_summary += quota_derivative[:, None] * model.layers[5][0][0, width:]
+    d_summary /= np.maximum(valid.sum(1, keepdims=True), 1)
+    d_hidden = (d_refined @ left + valid[:, :, None]*d_summary[:, None, :]) * (hidden > 0)
+    flat = d_hidden.reshape((-1, width))
+    grad_fine = d_hidden.sum(1)
+    gradients[2] = (np.column_stack((grad_fine.T @ fine,
+                     flat.T @ coarse.reshape((-1, width)),
+                     flat.T @ edges.reshape((-1, EDGE_FEATURES)))), grad_fine.sum(0))
+    left, middle, _ = np.split(model.layers[2][0], [width, 2*width], axis=1)
+    return gradients, d_fine + grad_fine @ left, d_hidden @ middle
 
 
 def sparse_entries(matrix, rows, columns):
@@ -540,7 +607,8 @@ def factor_cotangent(p, legacy, bridge, level, transfer_gradient, model):
             suffix_product = multiply(p, factors[1], factors[2])
             suffixes.insert(0, local_csr(p, suffix_product, bridge)[0])
         gradient = np.zeros(model.weights.shape, np.float64)
-        local = transfer_gradient
+        compression = getattr(level, "compression_tape", None)
+        local = transfer_gradient if compression is None else compression.pullback(transfer_gradient)
         for j, (tape, suffix) in enumerate(zip(fixed, suffixes)):
             entries = projected_factor(p, local, tape.csr, suffix, tape.owners)
             gradient += tape.backward(p, model, entries)
@@ -571,6 +639,8 @@ def frozen_transfer(p, legacy, bridge, level, parent, model):
         csr = local_csr(p, product, bridge)[0]
         csr.eliminate_zeros()
         csr.sort_indices()
+        if getattr(level, "compression_tape", None) is not None:
+            csr = level.compression_tape.apply(csr)
         return imported_transfer(p, legacy, parent, csr, level.fixed_factors[0].rows,
                                  level.owners, {})
     finally:
@@ -621,10 +691,11 @@ class FactorPolicy:
             self.log_probability += np.log(probability)
             self.trace.update(np.asarray([entity, chosen, original], dtype=np.int64).tobytes())
 
-    def representative_choice(self, features, scores, chosen, original, native, record):
+    def representative_choice(self, features, scores, chosen, original, native, record,
+                              inputs=None, regions=None):
         pass
 
-    def representatives(self, config, graph, hidden, logits, regions):
+    def representatives(self, config, graph, hidden, logits, regions, inputs=None):
         p = self.p
         native, labels, owned, limit = representative_domain(config, p, graph, self.stage)
         global_group = self.stage >= DEPTHS[0]
@@ -633,6 +704,9 @@ class FactorPolicy:
             width = hidden.shape[1]
             hidden = p.all_rows(hidden.ravel(), graph.owners*width).reshape((-1,width))
             regions = p.all_rows(regions, graph.owners).astype(np.int32)
+            if inputs is not None:
+                n = inputs.shape[1]
+                inputs = p.all_rows(inputs.ravel(), graph.owners*n).reshape((-1, n)).astype(inputs.dtype)
         selected = pick_representatives(native, labels, logits, limit)
         eligible = np.flatnonzero(labels >= 0)
         group = labels[eligible]
@@ -656,8 +730,10 @@ class FactorPolicy:
             sorted_members = retained[np.lexsort((native[retained], -logits[retained,0]))]
             released = sorted_members[-1]
             options = np.r_[released, members[~selected[members]]]
+            raw = None if inputs is None else inputs[options]
             if i in background:
-                self.representative_choice(hidden[options], logits[options, 0], 0, 0, native[options], record)
+                self.representative_choice(hidden[options], logits[options, 0], 0, 0, native[options],
+                                           record, raw, regions[options])
                 continue
             j, prob = self.choose(logits[options,0])
             winner = options[j]
@@ -665,7 +741,8 @@ class FactorPolicy:
             if record:
                 weight[0] += (hidden[winner] - prob @ hidden[options])/self.temperature
             self.record(native[released], native[winner], native[released], prob[j], record)
-            self.representative_choice(hidden[options], logits[options, 0], j, 0, native[options], record)
+            self.representative_choice(hidden[options], logits[options, 0], j, 0, native[options],
+                                       record, raw, regions[options])
         return selected[owned]
 
     def edges(self, outputs, quota, valid, same, keep, fine, summary, refined, native, regions,
@@ -716,12 +793,16 @@ class FactorPolicy:
 
 def predicted_factor(config, p, graph, model, stage, coordinates, training=None, policy=None):
     start = time.perf_counter()
+    detail = config.get("student_cycle") == "factor_cost"
+    inference = config["factorized"].get("compact_inference")
     regions = region_ids(graph.xyz)
     x = encoded_inputs(p, graph, stage)
     hidden, logits = model.node_outputs(x, stage, regions)
     actor = policy if policy is not None and policy.stage == stage else None
+    capture = getattr(policy, "capture_context", False)
     if actor is not None and actor.role == "representatives":
-        selected = actor.representatives(config, graph, hidden, logits, regions)
+        selected = actor.representatives(config, graph, hidden, logits, regions,
+                                         x if capture else None)
     else:
         selected = selections(config, p, graph, stage, logits)
     owners = coarse_owners(p, selected)
@@ -731,11 +812,24 @@ def predicted_factor(config, p, graph, model, stage, coordinates, training=None,
     encoded = time.perf_counter()
     cols, assignment, spacing, contacts, native = candidates(
         config, p, graph, selected, owners, coordinates, stage)
+    candidate_end = time.perf_counter() if detail else None
     active = np.flatnonzero(~graph.fixed & ~selected)
-    edges, same = edge_features(graph, cols[active], active, spacing, contacts, native, coordinates)
-    anchor_hidden = neighbour_blocks(p, owners, hidden[selected], cols[active])
+    active_cols = cols[active]
+    edges, same = edge_features(graph, active_cols, active, spacing, contacts, native, coordinates,
+                                packed=inference in ("packed", "support"))
+    feature_end = time.perf_counter() if detail else None
+    signed = model.coefficients_at(stage)
+    coefficient_hidden = coefficient_anchors = None
+    if signed is not model:
+        coefficient_hidden = np.maximum(0, signed.linear(0, x))
+    if coefficient_hidden is not None and config["factorized"].get("shared_anchor_exchange", False):
+        packed = np.column_stack((hidden[selected],coefficient_hidden[selected]))
+        anchor_hidden, coefficient_anchors = np.split(
+            neighbour_blocks(p, owners, packed, active_cols),2,axis=2)
+    else:
+        anchor_hidden = neighbour_blocks(p, owners, hidden[selected], active_cols)
     prepared = time.perf_counter()
-    valid = cols[active] >= 0
+    valid = active_cols >= 0
     tape = [] if actor is not None and actor.modify_edges else None
     outputs, quota = model.edge_outputs(hidden[active], anchor_hidden, edges, valid,
                                         stage, regions[active], tape)
@@ -743,8 +837,19 @@ def predicted_factor(config, p, graph, model, stage, coordinates, training=None,
     if tape is not None:
         keep = actor.edges(outputs, quota, valid, same, keep, hidden[active], tape[1], tape[2],
                            graph.native[active], regions[active],
-                           np.where(valid, native[np.maximum(cols[active], 0)], -1)
+                           np.where(valid, native[np.maximum(active_cols, 0)], -1)
                            if actor.settings.get("search") else None, graph.xyz[active])
+    if capture:
+        policy.observe_edges(p, stage, x, graph.native, selected, active, owners, active_cols,
+                             native, edges, valid, same, keep, outputs[:, :, 0], quota, regions[active])
+    structure_end = time.perf_counter() if detail else None
+    if coefficient_hidden is not None:
+        if coefficient_anchors is None:
+            coefficient_anchors = neighbour_blocks(p, owners, coefficient_hidden[selected], active_cols)
+        outputs, _ = signed.edge_outputs(coefficient_hidden[active], coefficient_anchors, edges,
+                                         valid, stage, regions[active],
+                                         keep=keep if inference == "support" and training is None else None)
+    coefficient_end = time.perf_counter() if detail else None
     weights = coefficients(outputs[:, :, 1], outputs[:, :, 2], keep, same,
                            unit_row_sum=stage < model.unit_sum_depth)
     raw = np.zeros(cols.shape, dtype=np.float64)
@@ -765,14 +870,22 @@ def predicted_factor(config, p, graph, model, stage, coordinates, training=None,
     all_ranks = p.gather_equal(np.stack(fingerprints)).astype(np.uint32)
     signatures = {name: hashlib.sha256(all_ranks[:, i].tobytes()).hexdigest()[:16]
                   for i, name in enumerate(("representatives", "support", "coefficients"))}
+    finished = time.perf_counter()
     stats = dict(stage=stage + 1, rows=int(graph.owners[-1]), columns=int(owners[-1]),
                  nnz=int(counts[0]), empty_free_rows=int(counts[1]),
                  selection_s=p.maximum(encoded - start), candidate_s=p.maximum(prepared - encoded),
-                 inference_s=p.maximum(time.perf_counter() - prepared),
+                 inference_s=p.maximum(finished - prepared),
                  signatures=signatures)
+    if detail:
+        names = ("candidates_s", "edge_features_s", "encoding_and_halo_s", "structure_s",
+                 "coefficients_s", "csr_and_signature_s")
+        points = [encoded, candidate_end, feature_end, prepared, structure_end, coefficient_end, finished]
+        stats["detail"] = dict(zip(names, p.reduce(np.diff(points), "max").tolist()))
+    if capture:
+        policy.archive_stage(stage, graph.native, selected, graph.owners, owners, csr)
     if training is not None:
         training.append(FixedFactor(stage, graph.owners, owners, x, selected, active,
-            regions[active], cols[active], edges, valid, same, keep & (weights != 0), csr))
+            regions[active], active_cols, edges, valid, same, keep & (weights != 0), csr))
     return csr, selected, owners, assignment, stats
 
 
@@ -796,11 +909,24 @@ def interval(config, p, legacy, bridge, matrix, graph, model, stage, coordinates
         start = time.perf_counter()
         product = compose(p, factors)
         raw, _ = local_csr(p, product, bridge)
-        if training is not None:
+        compress = stage == 0 and model.product_compression is not None
+        if training is not None and not compress:
             pattern = raw.copy()
             pattern.sort_indices()
         raw.eliminate_zeros()
+        raw.sort_indices()
         native = graph.native[selected]
+        compression = compression_tape = None
+        if compress:
+            from .factor_compress import compress_product
+
+            started = time.perf_counter()
+            global_native = p.all_rows(native, owners).astype(np.int64)
+            raw, compression_tape, compression = compress_product(
+                p, raw, initial.native, global_native, coordinates, model.product_compression)
+            compression["wall_s"] = p.maximum(time.perf_counter()-started)
+            if training is not None:
+                pattern = raw
         # Nested injection stays exact, with columns owned by their anchor rank.
         local_selected = np.isin(initial.native, native)
         degree = np.diff(raw.indptr)
@@ -815,6 +941,8 @@ def interval(config, p, legacy, bridge, matrix, graph, model, stage, coordinates
         info = dict(fine_dofs=int(parent_owners[-1]), coarse_dofs=int(owners[-1]),
                     nnz=int(stats[0]), empty_free_rows=int(stats[1]), injection_error=float(stats[2] > 0),
                     stages=stages, composition_s=p.maximum(time.perf_counter() - start))
+        if compression is not None:
+            info["compression"] = compression
         if stats[1] or stats[2] or stats[0] > maximum * parent_owners[-1]:
             raise InvalidFactorization("factor_product_coverage_injection_or_density", info)
         if stage + depth <= model.unit_sum_depth:
@@ -833,6 +961,8 @@ def interval(config, p, legacy, bridge, matrix, graph, model, stage, coordinates
         if training is not None:
             level.fixed_factors = training
             level.product_pattern = pattern
+            if compression_tape is not None:
+                level.compression_tape = compression_tape
         info["galerkin_s"] = p.maximum(time.perf_counter() - start)
         return level
     except InvalidFactorization as error:
@@ -916,6 +1046,87 @@ def read_factors(config, p, row, graph):
             factors.append(target)
     return maps, owners, factors, dict(path=str(receipt_path), sha256=digest(receipt_path),
                                        raw_hierarchy_job=receipt["job"], map_sha256=receipt["map_sha256"])
+
+
+def prune_rebuilt_teacher(p, legacy, csr, native, eligible, drop):
+    """Keep the source support coverage when restoring the offline teacher."""
+    original_empty = np.diff(csr.indptr)==0
+    pruned,_ = legacy.prune_transfer_connections(csr,native,drop)
+    pruned.sort_indices()
+    introduced = (np.diff(pruned.indptr)==0)&~original_empty
+    counts = p.reduce([np.count_nonzero(original_empty&eligible),np.count_nonzero(introduced&eligible)])
+    return (csr if counts[1] else pruned,
+            dict(source_empty_rows=int(counts[0]),rejected_pruned_rows=int(counts[1]),
+                 applied_drop=0. if counts[1] else drop))
+
+
+def rebuild_teacher_products(config,p,legacy,bridge,row,layout,fields,matrix):
+    """Rebuild the signed HMIS L3/L5 teacher on the current displacement block."""
+    from types import SimpleNamespace
+
+    lo,hi = layout["ownership"][p.rank:p.rank+2]
+    native = (3*layout["native_node"]+layout["component"])[lo:hi].astype(np.int64)
+    graph = SimpleNamespace(native=native,owners=layout["ownership"],fixed=fields["constrained"][native])
+    maps,owners,factors,source = read_factors(config,p,row,graph)
+    handles, products = [], []
+    first = second = None
+    try:
+        for i,factor in enumerate(factors):
+            handles.append(import_matrix(p,legacy,factor,owners[i],owners[i+1]))
+        products.append(compose(p,handles[:DEPTHS[0]]))
+        products.append(compose(p,handles[DEPTHS[0]:]))
+        transfers, coverage = [],[]
+        drop = config["factorized"]["cached_drop"]
+        for handle,stage in zip(products,(DEPTHS[0],STAGES)):
+            csr,_ = local_csr(p,handle,bridge)
+            csr.sum_duplicates()
+            csr.eliminate_zeros()
+            csr.sort_indices()
+            active = ~graph.fixed if stage==DEPTHS[0] else np.ones(csr.shape[0],bool)
+            transfer, evidence = prune_rebuilt_teacher(p,legacy,csr,maps[stage],active,drop)
+            transfers.append(transfer)
+            coverage.append(evidence)
+        # Match the retained teacher's contiguous balanced middle and
+        # terminal partitions. Only the small P2 is gathered for redistribution.
+        sizes = [int(owners[i][-1]) for i in (DEPTHS[0],STAGES)]
+        middle, terminal = [np.arange(p.size+1,dtype=np.int64)*n//p.size for n in sizes]
+        a,b = transfers
+        lengths = p.all_rows(np.diff(b.indptr),owners[DEPTHS[0]]).astype(np.int64)
+        nnz = np.r_[0,np.cumsum(p.gather_equal([b.nnz]).ravel().astype(np.int64))]
+        row_ptr = np.r_[0,np.cumsum(lengths)]
+        indices = p.all_rows(b.indices,nnz).astype(np.int32)
+        values = p.all_rows(b.data,nnz)
+        start,end = middle[p.rank:p.rank+2]
+        begin,stop = row_ptr[[start,end]]
+        b = sparse.csr_matrix((values[begin:stop],indices[begin:stop],row_ptr[start:end+1]-begin),
+                              shape=(end-start,sizes[1]))
+        def injection(csr,nodes,anchors):
+            rows = np.flatnonzero(np.isin(nodes,anchors))
+            return (np.all(np.diff(csr.indptr)[rows]==1)
+                    and np.array_equal(csr.indices[csr.indptr[rows]],ordered_columns(nodes[rows],anchors))
+                    and np.allclose(csr.data[csr.indptr[rows]],1.,rtol=0.,atol=1e-12))
+        defects = p.reduce([np.count_nonzero((np.diff(a.indptr)==0)&~graph.fixed),
+                           np.count_nonzero(np.diff(b.indptr)==0),
+                           int(not injection(a,native,maps[DEPTHS[0]])),
+                           int(not injection(b,maps[DEPTHS[0]][start:end],maps[STAGES]))])
+        if np.any(defects[2:]) or list(defects[:2])!=[item["source_empty_rows"] for item in coverage]:
+            raise ValueError("Rebuilt teacher changed source coverage or injection: "+str(defects.tolist()))
+        def stats(csr,rows,columns,proof):
+            gaps = proof["source_empty_rows"]
+            return dict(nnz=int(p.reduce([csr.nnz])[0]),fine_dofs=int(rows[-1]),
+                        coarse_dofs=int(columns[-1]),empty_free_rows=gaps,uncovered_free_rows=gaps,
+                        verified_source_empty_rows=gaps,injection_error=0.,repair_budget_exhausted=0)
+        first = imported_transfer(p,legacy,matrix,a,owners[0],middle,stats(a,owners[0],middle,coverage[0]))
+        second = imported_transfer(p,legacy,first.coarse,b,middle,terminal,stats(b,middle,terminal,coverage[1]))
+        return first,second,dict(source=source,relative_drop=drop,coverage=coverage,
+                                 balanced_coarse_ownership=True)
+    except BaseException:
+        for level in (second,first):
+            if level is not None:
+                level.close()
+        raise
+    finally:
+        p.destroy("Mat",*products,*handles)
 
 
 def ordered_columns(native, ordered):

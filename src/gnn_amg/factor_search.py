@@ -28,10 +28,9 @@ class SearchProposal(FactorPolicy):
         self.modify_edges = True
         self.added = []
         self.examples = []
-        self.example_limit = (settings.get("examples", 0)
-                              if p.rank % max(1, p.size//8) == 0 else 0)
+        self.example_limit = settings.get("examples", 0)
 
-    def example(self, layer, features, scores, chosen, original, ids):
+    def example(self, layer, features, scores, chosen, original, ids, row=None):
         same = chosen == original
         if sum(item["layer"] == layer and item["unchanged"] == same
                for item in self.examples) >= self.example_limit:
@@ -42,7 +41,8 @@ class SearchProposal(FactorPolicy):
                                   stage=self.stage+1, region=self.region,
                                   temperature=self.temperature))
 
-    def representative_choice(self, features, scores, chosen, original, native, record):
+    def representative_choice(self, features, scores, chosen, original, native, record,
+                              inputs=None, regions=None):
         if chosen != original:
             self.added.append(native[chosen])
         if record:
@@ -117,23 +117,31 @@ class SearchProposal(FactorPolicy):
             keep[row, previous], keep[row, chosen] = False, True
             self.record(native[row], candidate_ids[row, chosen], candidate_ids[row, previous],
                         prob[choice], True)
-            self.example(4, refined[row, options], candidate_scores, index, 0, candidate_ids[row, options])
+            self.example(4, refined[row, options], candidate_scores, index, 0, candidate_ids[row, options], row)
         for row in np.setdiff1d(rows, selected)[:self.example_limit]:
             options = np.r_[order[row, count[row]-1], np.flatnonzero(valid[row] & ~keep[row])]
-            self.example(4, refined[row, options], scores[row, options], 0, 0, candidate_ids[row, options])
+            self.example(4, refined[row, options], scores[row, options], 0, 0, candidate_ids[row, options], row)
         return keep
 
     def budget_example(self, row, chosen, count, capacity, features, quota):
         options = np.arange(max(1, count[row]-1), min(capacity[row], count[row]+1)+1)
         self.example(5, 2*(options[:, None]-3.)*features[row],
-                     -(options-3.-quota[row])**2, chosen-options[0], count[row]-options[0], options)
+                     -(options-3.-quota[row])**2, chosen-options[0], count[row]-options[0], options, row)
 
     def receipt(self):
         result = super().receipt()
         result.pop("gradient")
         result["role"] = self.kind
         if self.settings.get("examples"):
-            payload = np.frombuffer(json.dumps(self.examples, allow_nan=False).encode(), np.uint8)
+            layers = (1, 4, 5)
+            active = self.p.gather_equal([sum(row["layer"] == layer and not row["unchanged"]
+                                              for row in self.examples) for layer in layers])
+            selected = set()
+            for counts in active.T:
+                ranks = np.flatnonzero(counts)
+                selected.update(ranks[np.linspace(0, len(ranks)-1, min(8, len(ranks)), dtype=int)])
+            examples = self.examples if self.p.rank in selected else []
+            payload = np.frombuffer(json.dumps(examples, allow_nan=False).encode(), np.uint8)
             padded = np.zeros(int(self.p.maximum(len(payload))), np.uint8)
             padded[:len(payload)] = payload
             packets = self.p.gather_equal(padded)
@@ -273,9 +281,10 @@ def noise_floor(base, settings):
 def confirmed_improvement(first_base, first, second_base, second, settings):
     if any(not row.get("passed") for row in (first_base, first, second_base, second)):
         return False
-    if (first_base["hierarchy_signature"] != second_base["hierarchy_signature"]
-            or first["hierarchy_signature"] != second["hierarchy_signature"]):
-        return False
+    for screened, repeated in ((first_base, second_base), (first, second)):
+        signature = screened.get("hierarchy_signature")
+        if not signature or tuple(signature) != tuple(repeated.get("hierarchy_signature") or ()):
+            return False
     gaps = [base["total_s"]-trial["total_s"] for base,trial in ((first_base,first),(second_base,second))]
     return (min(gaps) > 0 and np.mean(gaps) >= noise_floor(first_base, settings)
             and all(physical_improvement(base, trial) for base,trial in ((first_base,first),(second_base,second))))
@@ -332,6 +341,63 @@ def structural_model(model, examples, deltas, settings):
     return FactorModel(model.width, trial.weights.astype(model.weights.dtype), model.adapters, model.unit_sum_depth)
 
 
+def search_recovery(config, p, share):
+    """Restore only the immutable screening and confirmation of the original model."""
+    recovery = config.get("factor_search_recovery")
+    if recovery is None:
+        return None
+
+    def read(receipt):
+        if digest(receipt["path"]) != receipt["sha256"]:
+            raise ValueError("Search recovery receipt changed: " + receipt["path"])
+        return read_json(receipt["path"])
+
+    local = []
+    if p.global_rank == 0:
+        original = read(recovery["config"])
+        compatible = ("factor_search", "factor_model", "factor_reference", "factor_feedback",
+                      "factorized", "gate_keys", "training", "rtol", "atol", "max_iterations",
+                      "mpi_ranks", "parallel_workers", "inventory_sha256", "image_sha256",
+                      "bridge_sha256", "student_library_sha256", "dependency_hashes",
+                      "baseline_directory", "baseline_label")
+        if any(original[key] != config[key] for key in compatible):
+            raise ValueError("Search recovery settings differ from the original experiment")
+        report = read(recovery["report"])
+        if (report["job"] != recovery["job"] or report["mode"] != "factor_search"
+                or any(r["promoted"] or r["incumbent"] != config["factor_model"] for r in report["rounds"])):
+            raise ValueError("Archived pairs do not all use the original incumbent")
+        local.append(dict(report=report, screens=[read(r) for r in recovery["screens"]]))
+    return share(local)[0]
+
+
+def restore_labels(p, keys, frames, checked, origin, workers, load, destroy, solve, share):
+    """Rebuild saved winners whose sampling ranks recorded no changed decisions."""
+    local = []
+    for row in checked:
+        key, name = row["key"], row["method"]
+        if not row["accepted"] or name == "coefficient" or keys.index(key)%workers != p.worker:
+            continue
+        examples = row["candidate"]["factor_policy"]["examples"]
+        if any(not item["unchanged"] for item in examples):
+            continue
+        policy = frames[key]["proposals"][int(name.split("-")[-1])]
+        method = dict(name=name, factor_model=origin, factor_policy=dict(policy, examples=3),
+                      factor_policy_replay=True)
+        state = load(key)
+        try:
+            replay = solve(key, state, method, "search-recover-labels", details=False)
+        finally:
+            destroy(state)
+        if p.rank != 0:
+            continue
+        matches = (replay["failure"] is None
+                   and hierarchy_signature(replay["numerical"]) == tuple(row["candidate"]["hierarchy_signature"])
+                   and replay["factor_policy"]["signature"] == row["candidate"]["factor_policy"]["signature"])
+        local.append(dict(key=key, method=name, matches=bool(matches),
+                          examples=replay["factor_policy"]["examples"] if matches else []))
+    return share(local)
+
+
 def search_distill(config, p, train, load, destroy, solve, share, evaluate, job):
     settings = config["factor_search"]
     history = settings["historical_audit"]
@@ -354,11 +420,14 @@ def search_distill(config, p, train, load, destroy, solve, share, evaluate, job)
     incumbent, incumbent_receipt = origin, config["factor_model"]
     control = dict(config["factor_reference"], fallback=False)
     baseline = dict(name="origin", factor_model=origin)
+    recovery = search_recovery(config, p, share)
+    archived = None if recovery is None else recovery["report"]
+    reused = Counter()
     calibration = []
     windows = dict.fromkeys(("iteration-24", "late", "displacement-0", "displacement-1",
                              "displacement-2"), settings["prefixes"])
     workers = config["parallel_workers"]
-    for index, key in enumerate(config["gate_keys"]):
+    for index, key in enumerate(() if recovery else config["gate_keys"]):
         if index % workers != p.worker:
             continue
         state = load(key)
@@ -378,19 +447,26 @@ def search_distill(config, p, train, load, destroy, solve, share, evaluate, job)
             calibration.append(dict(key=key, anchor=anchor, controls=controls))
         finally:
             destroy(state)
-    calibration = share(calibration)
+    if recovery:
+        calibration = archived["calibration"]
+        reused["calibration"] = len(calibration)
+    else:
+        calibration = share(calibration)
     targets, diagnostics = calibrated_targets(calibration, settings)
+    if recovery and (targets != archived["targets"] or diagnostics != archived["windows"]):
+        raise ValueError("Recomputed probe calibration differs from the archived result")
     if p.global_rank == 0:
         save_once(output/"records"/("factor-search-calibration-%s.json" % job),
                   dict(frames=calibration, targets=targets, windows=diagnostics))
-        record(config, "factor_search_calibration", job=job, targets=targets, windows=diagnostics)
+        record(config, "factor_search_calibration", job=job, targets=targets, windows=diagnostics,
+               reused_from=archived["job"] if recovery else None)
     observations, replay_bank, coefficient_bank = [], [], []
     confirmation_count = 0
     counts = Counter(calibration=len(calibration))
     for round_index, keys in enumerate(rounds, 1):
         phase = "search-%d" % round_index
         local = []
-        for index, key in enumerate(keys):
+        for index, key in enumerate(() if recovery else keys):
             if index % workers != p.worker:
                 continue
             state, inputs, seen = load(key), [], set()
@@ -428,9 +504,14 @@ def search_distill(config, p, train, load, destroy, solve, share, evaluate, job)
             finally:
                 destroy(state)
             local.append(dict(key=key, proposals=proposals, cases=cases))
-        screening = share(local)
+        screening = recovery["screens"][round_index-1] if recovery else share(local)
+        if sorted(frame["key"] for frame in screening) != sorted(keys):
+            raise ValueError("Archived search frame list differs from the current round")
+        screened = sum(row.get("iterations") is not None for frame in screening for row in frame["cases"])
+        if recovery:
+            reused["screened"] += screened
         counts["screen_attempts"] += sum(len(frame["cases"]) for frame in screening)
-        counts["screened"] += sum(row.get("iterations") is not None for frame in screening for row in frame["cases"])
+        counts["screened"] += screened
         counts["duplicates"] += sum(bool(row.get("duplicate")) for frame in screening for row in frame["cases"])
         counts["coefficient_proposals"] += sum(row["method"] == "coefficient"
                                               for frame in screening for row in frame["cases"])
@@ -447,9 +528,10 @@ def search_distill(config, p, train, load, destroy, solve, share, evaluate, job)
         if p.global_rank == 0:
             save_once(output/"records"/("factor-search-screen-%s-r%d.json" % (job, round_index)), screening)
             record(config, "factor_search_screened", job=job, round=round_index, shortlist=len(shortlist),
-                   counts=dict(counts))
+                   counts=dict(counts), reused_from=archived["job"] if recovery else None)
+        selected = shortlist[:settings["confirm_pairs"]]
         local = []
-        for _, key, name, frame in shortlist[:settings["confirm_pairs"]]:
+        for _, key, name, frame in (() if recovery else selected):
             if keys.index(key)%workers != p.worker:
                 continue
             state = load(key)
@@ -467,29 +549,53 @@ def search_distill(config, p, train, load, destroy, solve, share, evaluate, job)
                              phase+"-confirm", details=False)
             finally:
                 destroy(state)
-            first = next(row for row in frame["cases"] if row["method"] == name)
-            accepted = confirmed_improvement(anchor, first, base, second, settings)
-            local.append(dict(key=key, method=name, accepted=bool(accepted), base=base, candidate=second))
-        checked = share(local)
-        counts["confirmed_calls"] += sum(r[field].get("iterations") is not None
-                                         for r in checked for field in ("base", "candidate"))
+            local.append(dict(key=key, method=name, base=base, candidate=second))
+        checked = archived["rounds"][round_index-1]["checked"] if recovery else share(local)
+        if {(row["key"], row["method"]) for row in checked} != {(row[1], row[2]) for row in selected}:
+            raise ValueError("Search confirmation does not match the screened shortlist")
+        frames = {frame["key"]: frame for frame in screening}
+        for row in checked:
+            cases = frames[row["key"]]["cases"]
+            first = next(case for case in cases if case["method"] == row["method"])
+            if recovery:
+                row["archived_accepted"] = row["accepted"]
+            row["accepted"] = bool(confirmed_improvement(cases[0], first, row["base"], row["candidate"], settings))
+        rebuilt = []
+        confirmations = sum(row[field].get("iterations") is not None
+                            for row in checked for field in ("base", "candidate"))
+        if recovery:
+            reused["confirmed_calls"] += confirmations
+            rebuilt = restore_labels(p, keys, frames, checked, origin, workers, load, destroy, solve, share)
+            counts["label_rebuilds"] += len(rebuilt)
+        counts["confirmed_calls"] += confirmations
         confirmation_count += len(checked)
+        regenerated = {(row["key"], row["method"]): row for row in rebuilt}
         round_winners = []
+        training_base = origin if recovery else incumbent
         for row in checked:
             if not row["accepted"]:
                 continue
             if row["method"]=="coefficient":
-                anchor = next(item["cases"][0] for item in screening if item["key"]==row["key"])
-                candidate = coefficient_candidate(incumbent, anchor, settings)
-                coefficient_bank.append(candidate.weights.astype(np.float64)-incumbent.weights)
+                anchor = frames[row["key"]]["cases"][0]
+                candidate = coefficient_candidate(training_base, anchor, settings)
+                coefficient_bank.append(candidate.weights.astype(np.float64)-training_base.weights)
             else:
-                replay_bank.extend(row["candidate"]["factor_policy"]["examples"])
+                replay = regenerated.get((row["key"], row["method"]))
+                examples = row["candidate"]["factor_policy"]["examples"] if replay is None else replay["examples"]
+                row["distilled_examples"] = len(examples)
+                if not any(not item["unchanged"] for item in examples):
+                    continue
+                replay_bank.extend(examples)
             round_winners.append((row["key"], row["method"]))
-        trial = structural_model(incumbent, replay_bank, coefficient_bank, settings)
+        # Archived examples were all generated by the same origin model.
+        # Fit each cumulative trial on that same reference and pair it
+        # against the best deterministic model retained by validation.
+        trial = (structural_model(training_base, replay_bank, coefficient_bank, settings)
+                 if round_winners or not recovery else incumbent)
         change = float(np.linalg.norm(trial.weights-incumbent.weights))
         summary = dict(round=round_index, keys=keys, shortlist=len(shortlist), checked=checked,
                        winners=round_winners, examples=len(replay_bank), coefficient_examples=len(coefficient_bank),
-                       parameter_delta=change, promoted=False)
+                       restored_labels=rebuilt, parameter_delta=change, promoted=False)
         methods = [dict(name="incumbent", factor_model=incumbent)]
         if change:
             methods.append(dict(name="distilled", factor_model=trial))
@@ -513,11 +619,20 @@ def search_distill(config, p, train, load, destroy, solve, share, evaluate, job)
         if p.global_rank == 0:
             save_once(output/"records"/("factor-search-round-%s-r%d.json" % (job, round_index)), summary)
             record(config, "factor_search_round", job=job, round=round_index, winners=round_winners,
-                   examples=len(replay_bank), promoted=summary["promoted"], totals=summary.get("totals"))
+                   examples=len(replay_bank), promoted=summary["promoted"], totals=summary.get("totals"),
+                   reused_from=archived["job"] if recovery else None,
+                   restored_labels=[{k:v for k,v in r.items() if k != "examples"} for r in rebuilt])
     finalists = [baseline, control]
     if incumbent_receipt != config["factor_model"]:
         finalists.insert(1, dict(name="best_distilled", factor_model=incumbent))
-    final = evaluate(validation, finalists, "search-final", repeats=2)
+    if recovery and len(finalists) == 2:
+        final = archived["cases"]
+        assert {(row["repeat"], row["method"], row["key"]) for row in final} == {
+            (repeat, label, key) for repeat in range(2) for label in ("origin", "student") for key in validation
+        }
+        reused["final_validation"] = sum(row.get("iterations") is not None for row in final)
+    else:
+        final = evaluate(validation, finalists, "search-final", repeats=2)
     counts["final_validation"] += sum(row.get("iterations") is not None for row in final)
     repetitions = [method_totals([row for row in final if row["repeat"]==index]) for index in range(2)]
     def faster(name, reference):
@@ -536,5 +651,6 @@ def search_distill(config, p, train, load, destroy, solve, share, evaluate, job)
                 totals=method_totals(final), model=receipt, winner=winner,
                 model_improved=bool(improved), speed_gate=bool(improved and faster(winner, "student")),
                 full_solves=solved, maximum_full_calls=maximum_calls, solve_counts=dict(counts),
-                confirmations=confirmation_count,
+                recovered_from=archived["job"] if recovery else None, reused_solve_counts=dict(reused),
+                fresh_full_solves=solved-sum(reused.values()), confirmations=confirmation_count,
                 timing_scope="Replay cold construction and true residual. Short probes are recorded separately.")

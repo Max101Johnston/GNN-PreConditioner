@@ -433,3 +433,73 @@ second repeat and includes the original checkpoint and the signed student.
 Select this mode with `stage: review` and `student_cycle: factor_search` in an
 external frozen configuration. The analysis records the probe calibration,
 each round's screen and confirmation outcomes, and the final paired solves.
+
+### Structure and displacement operator fitting
+
+Use a frozen review configuration with `student_cycle=factor_operator`.
+The structure fit rebuilds verified winning hierarchies and retains their
+executed factor supports, actual K1 shards, full candidate rows for changed
+decisions, and behaviour guards. It trains the structural feature network
+and selects by deterministic action reproduction and guard retention.
+Reports distinguish legal-slot reproduction from exact hard support rows.
+
+Each coarse level has an independent coefficient encoder. The first updates
+hold P1 fixed. The displacement loss compares the retained teacher and the
+learner on the same PCApply and balanced regional inputs. The adjoint
+differentiates the executed Galerkin cycle on fixed decoded feature tapes.
+Each proposed update rebuilds the deployment hierarchy using the actual K1
+before it can be accepted.
+
+Full GMRES and same-input prefix trajectories are checked on the pilot
+training frames. A quality gate controls fixed eight-frame replay and the
+later complexity study. Reports and probe archives remain in the analysis
+workspace.
+
+### Replay training across the saved matrices
+
+`factor_compare` evaluates a frozen generator and student on the fixed eight
+validation frames in two alternating orders. `factor_replay_train` rotates
+training frames by source case and time stratum. Existing probes remain in the
+frame pool when fresh PCApply inputs are added. The objective balances actual
+and regional inputs and penalizes a small upper tail of relative regressions
+against a fixed reference. Line search and the gradient use the same pool.
+The action and solver checkpoints are selected using training diagnostics
+before the fixed validation frames are evaluated.
+
+The coefficient branches share one packed halo exchange for candidate anchors.
+The two feature vectors and networks remain separate. The pilot enables this
+path after matching executed hierarchy signatures and probe outputs against
+the original exchange.
+
+### Compress the generated first transfer
+
+Use `student_cycle=factor_compress` with the qualified replay solver.
+The support head learns the effect of dropping individual entries on
+first-coarse vectors from archived training probes. The row budget learns
+from the signed effect of dropping a sequence of entries. Removed weights
+are added to a retained anchor of the same displacement component.
+Coarse injection, constrained rows, and signed component sums are checked.
+
+The compressed transfer builds its own Galerkin matrix and second level.
+Fixed-mask directional derivatives check the coefficient pullback before
+any coefficient update. The pilot measures cold construction, GMRES and
+the actual nonzeros of both P1 and K1. Only an eligible pilot reaches the
+paired fixed-eight comparison with the uncompressed solver and student.
+
+### Uncompressed construction and focused replay
+
+Use `student_cycle=factor_cost` with an uncompressed coefficient checkpoint
+and its verified replay report. The study splits construction into graph,
+candidate, inference, assembly and solver setup stages. A sampled solve
+records fine RAS and matvecs, both transfers, middle ILU and matvecs, and
+terminal communication and solve. Component times come from the same rank.
+The cold-start comparisons run without the sampled PCApply instrumentation.
+
+The two optional inference paths pack features directly as float32 and can
+limit the last coefficient layers to the executed support. A path reaches
+the paired timing comparison after reproducing all factor signatures and
+displacement probe actions. Focused training adds early and late actual
+PCApply inputs to the existing archive and keeps the structural weights.
+New checkpoints are ranked by paired cold-start time at the same residual
+threshold on separate diagnostic frames. Only a changed candidate reaches
+the fixed eight validation frames in two alternating orders.

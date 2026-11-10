@@ -18,7 +18,7 @@ def save_once(path, value):
 def compact(result, frame, method, elapsed=None, fallback=None):
     n = result["numerical"]
     first, second = n.get("level1", {}), n.get("level2", {})
-    return dict(key=frame["key"], split=frame["split"], method=method,
+    brief = dict(key=frame["key"], split=frame["split"], method=method,
         passed=result["reached_true_target"] and not result.get("timed_out"), failure=result["failure"],
         total_s=result.get("total_wall_s", result["setup_wall_s"]) if elapsed is None else elapsed,
         setup_s=result["setup_wall_s"], solve_s=result.get("solve_s"),
@@ -45,6 +45,10 @@ def compact(result, frame, method, elapsed=None, fallback=None):
         hierarchy_signature=result.get("hierarchy_signature"),
         factor_trajectories=result.get("factor_trajectories"), factor_probe_s=result.get("factor_probe_s"),
         teacher=result.get("student_teacher"))
+    for name in ("setup_breakdown", "displacement_apply_profile"):
+        if name in result:
+            brief[name] = result[name]
+    return brief
 
 
 def method_totals(cases):
@@ -549,6 +553,7 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
             context = dict(factor_model=method["factor_model"], archive_choices=False, tag=tag,
                            probe_inputs=method.get("probe_inputs"), short_krylov=method.get("short_krylov"),
                            factor_feedback=method.get("factor_feedback"))
+            context.update(method.get("factor_context", {}))
             for setting in ("factor_probe_inputs", "factor_probe_capture", "factor_probe_windows",
                             "factor_probe_only", "factor_signatures"):
                 if setting in method:
@@ -566,17 +571,21 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
                 context["factor_policy_replay"] = method.get("factor_policy_replay", False)
             result = solve_policy(config, p, replay, legacy, bridge, None, row, layout, fields, data,
                                   context=context)
-            if context.get("factor_policy_replay") or context.get("factor_probe_only"):
+            if (context.get("factor_policy_replay") or context.get("factor_probe_only")
+                    or context.get("factor_operation") is not None):
                 return result
             if result.get("duplicate"):
                 return dict(result, key=key, method=label)
-        elif label in ("amg", "retained_base"):
-            teacher = retained_teacher(config, row) if label == "retained_base" else None
+        elif label in ("amg", "retained_base", "factor_teacher"):
+            teacher = retained_teacher(config,row) if label=="retained_base" else None
+            if label=="factor_teacher":
+                teacher = dict(fields=fields)
             if label == "retained_base" and teacher is None:
                 return None
             result = run_method(config, p, replay, legacy, bridge, row, layout, data, label, teacher,
-                                method.get("factor_probe_inputs"), method.get("factor_probe_windows"))
-            if "factor_probe_inputs" in method:
+                                method.get("factor_probe_inputs"), method.get("factor_probe_windows"),
+                                method.get("displacement_inputs"))
+            if "factor_probe_inputs" in method or "displacement_inputs" in method:
                 return result
         elif label == "teacher_roundtrip" or direct:
             teacher = load_teacher(config, p, row, layout)
@@ -735,6 +744,38 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
                           gradient_norm=update["gradient_norm"], paired=paired, paired_totals={split:method_totals(
                               [row for row in paired if row["split"] == split])
                               for split in sorted({r["split"] for r in paired})})
+    elif mode == "factor_compare":
+        from .factorized import load_model
+
+        keys = config["training"]["validation_keys"]
+        assert len(keys)==len(set(keys))==8 and all(frames[key]["split"]=="validation" for key in keys)
+        methods = [dict(name="operator",factor_model=load_model(config["factor_model"])),
+                   dict(config["factor_reference"],fallback=False)]
+        cases = evaluate(keys,methods,"factor-check",repeats=2)
+        repeats = [method_totals([row for row in cases if row["repeat"]==i]) for i in range(2)]
+        def compared(limit):
+            return all(len(row)==2 and all(s["frames"]==len(keys) and not s["failed"] for s in row.values())
+                       and row["operator"]["iterations"]<=row["student"]["iterations"]
+                       and row["operator"]["total_s"]<=limit*row["student"]["total_s"] for row in repeats)
+        report.update(model=config["factor_model"],keys=keys,cases=cases,repeat_totals=repeats,
+                      totals=method_totals(cases),speed_gate=compared(.98),compression_gate=compared(1.05))
+    elif mode == "factor_cost":
+        from .factor_replay import run_cost_replay
+
+        report.update(run_cost_replay(config, p, legacy, bridge, frames, load, destroy, solve, share, evaluate, job))
+    elif mode == "factor_compress":
+        from .factor_compress import run_compression
+
+        report.update(run_compression(config,p,legacy,bridge,frames,load,destroy,solve,share,evaluate,job))
+    elif mode == "factor_replay_train":
+        from .factor_replay import run_probe_replay
+
+        report.update(run_probe_replay(config,p,legacy,bridge,frames,load,destroy,solve,share,evaluate,job))
+        status = 0 if report["coverage_complete"] else 2
+    elif mode == "factor_operator":
+        from .factor_operator import run_operator
+
+        report.update(run_operator(config, p, legacy, bridge, frames, load, destroy, solve, share, evaluate, job))
     elif mode == "factor_search":
         from .factor_search import search_distill
 

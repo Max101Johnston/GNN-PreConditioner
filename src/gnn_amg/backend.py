@@ -204,6 +204,31 @@ class Level:
         self.p.destroy("Mat", self.transfer, self.coarse)
 
 
+def measured_action(seconds, name, action):
+    def run(*args, **kwargs):
+        begin = time.perf_counter()
+        value = action(*args, **kwargs)
+        seconds[name] = seconds.get(name, 0.) + (time.perf_counter() - begin)
+        return value
+    return run
+
+
+def displacement_correction(local, space, fine, residual, tape=None, profile=None):
+    """Apply the production RAS and coarse correction to an owned residual."""
+    ras = local.apply
+    if profile is not None:
+        ras = measured_action(profile, "fine_ras", ras)
+        fine = measured_action(profile, "fine_matvec", fine)
+    answer = ras(residual)
+    defect = residual - fine(answer)
+    if profile is not None:
+        answer += space.gain(defect, tape, profile)
+    else:
+        answer += space.gain(defect) if tape is None else space.gain(defect, tape)
+    answer += .5 * ras(residual - fine(answer))
+    return answer
+
+
 class Hierarchy:
     """Three levels: RAS is supplied externally; one fixed middle ILU cycle."""
     def __init__(self, p, legacy, first, second, terminal_limit):
@@ -234,18 +259,27 @@ class Hierarchy:
         self.direction_calls = 0
         self.direction_sample_calls = (0, 2, 6, 14)
 
-    def gain(self, residual, tape=None):
+    def gain(self, residual, tape=None, profile=None):
         a, b = self.first, self.second
-        rhs = a.P(residual, transpose=True)
-        pre = self.middle.apply(rhs)
-        defect = rhs - a.K(pre)
-        small = b.P(defect, transpose=True)
-        global_rhs = self.p.all_rows(small, b.owners)
-        correction = self.solve(self.factor, global_rhs)
+        p1, p2, k1 = a.P, b.P, a.K
+        ilu, gather, solve = self.middle.apply, self.p.all_rows, self.solve
+        if profile is not None:
+            p1 = measured_action(profile, "p1_transfer", p1)
+            p2 = measured_action(profile, "p2_transfer", p2)
+            k1 = measured_action(profile, "middle_matvec", k1)
+            ilu = measured_action(profile, "middle_ilu", ilu)
+            gather = measured_action(profile, "terminal_gather", gather)
+            solve = measured_action(profile, "terminal_solve", solve)
+        rhs = p1(residual, transpose=True)
+        pre = ilu(rhs)
+        defect = rhs - k1(pre)
+        small = p2(defect, transpose=True)
+        global_rhs = gather(small, b.owners)
+        correction = solve(self.factor, global_rhs)
         lo, hi = map(int, b.owners[self.p.rank:self.p.rank+2])
         coarse = correction[lo:hi]
-        middle = pre + b.P(coarse)
-        post = self.middle.apply(rhs - a.K(middle))
+        middle = pre + p2(coarse)
+        post = ilu(rhs - k1(middle))
         answer = middle + post
         if tape is not None:
             tape.extend((residual, pre, defect, coarse, middle, post, answer))
@@ -253,7 +287,7 @@ class Hierarchy:
             if self.direction_calls in self.direction_sample_calls:
                 self.direction_samples.append((answer.copy(), correction[lo:hi].copy()))
             self.direction_calls += 1
-        return a.P(answer)
+        return p1(answer)
 
     def parity(self, fine):
         errors = []

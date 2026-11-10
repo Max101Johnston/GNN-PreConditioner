@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-from .backend import (Action, Hierarchy, Level, digest, graph_features, load_bridge,
+from .backend import (Action, Hierarchy, Level, digest, displacement_correction, graph_features, load_bridge,
     load_dependencies, local_csr, ownership, pooled_attributes, read_json, record, solve_with_deadline,
     strength_graph)
 from .dataset import gather_array, gather_graph, physical_attributes
@@ -97,11 +97,8 @@ class DisplacementPC:
     timings: dict
     failure: object
 
-    def correction(self, residual, tape=None):
-        answer = self.local.apply(residual)
-        answer += self.space.gain(residual - self.fine(answer), tape)
-        answer += .5 * self.local.apply(residual - self.fine(answer))
-        return answer
+    def correction(self, residual, tape=None, profile=None):
+        return displacement_correction(self.local, self.space, self.fine, residual, tape, profile)
 
     def apply(self, source, target):
         self.p.assign(target, self.correction(self.p.array(source)))
@@ -166,7 +163,10 @@ def prepare_factorized(config, p, legacy, bridge, k, layout, fields, fine, local
                           train_weights, policy)
         numerical["level2"] = second.stats
         proposed_second = second.executed_markers == 1
+        start = time.perf_counter()
         space, failure = finish_hierarchy(config, p, legacy, bridge, fine, first, second, numerical)
+        if config.get("student_cycle") == "factor_cost":
+            timings["coarse_cycle_and_audit_s"] = p.maximum(time.perf_counter()-start)
     except InvalidFactorization as error:
         failure = str(error)
         numerical[level_key] = error.stats
@@ -176,6 +176,7 @@ def prepare_factorized(config, p, legacy, bridge, k, layout, fields, fine, local
 
 def prepare_displacement(config, p, legacy, bridge, rpc, k, layout, fields, cache,
                          neutral=False, context=None):
+    start = time.perf_counter()
     fine = Action(p, k)
     lo, hi = map(int, layout["ownership"][p.rank:p.rank+2])
     native = (3*layout["native_node"] + layout["component"])[lo:hi].astype(np.int64)
@@ -183,9 +184,19 @@ def prepare_displacement(config, p, legacy, bridge, rpc, k, layout, fields, cach
     fixed = fields["constrained"][native]
     local = legacy.LocalPC(p, k, cache, lo, hi, "ras")
     if (context or {}).get("factor_model") is not None:
-        return prepare_factorized(config, p, legacy, bridge, k, layout, fields, fine, local,
-                                  context["factor_model"], context.get("factor_feedback") is not None,
-                                  context.get("factor_policy"))
+        local_elapsed = time.perf_counter()-start
+        options = config["factorized"]
+        if "factor_fusion" in context:
+            options = dict(options, shared_anchor_exchange=context["factor_fusion"])
+        if context.get("factor_inference"):
+            options = dict(options, compact_inference=context["factor_inference"])
+        displacement = prepare_factorized(dict(config, factorized=options), p, legacy, bridge, k,
+            layout, fields, fine, local, context["factor_model"],
+            context.get("factor_feedback") is not None or context.get("factor_tape", False),
+            context.get("factor_policy"))
+        if config.get("student_cycle") == "factor_cost":
+            displacement.timings["fine_ras_setup_s"] = p.maximum(local_elapsed)
+        return displacement
     fast = (context or {}).get("fast_prior", False)
     if fast and (neutral or context.get("policy") != "prior_only" or context.get("training")
                  or config["decoder"]["kind"] != "directed_graph"):
@@ -310,9 +321,22 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     p.call("PCSetUp", fs)
     child, original, operator, k = replay.pcapply_child(p, fs, rows, expected_pc=b"none")
     cache = Path(config["baseline_directory"]) / "cache" / row["case"]
+    profile_setup = config.get("student_cycle") == "factor_cost"
+    outer_ready = time.perf_counter() if profile_setup else None
     displacement = prepare_displacement(config, p, legacy, bridge, rpc, k, layout, fields,
                                         cache, neutral, context)
+    hierarchy_ready = time.perf_counter() if profile_setup else None
     context = context or {}
+    operation = context.get("factor_operation")
+    if operation is not None:
+        try:
+            if displacement.failure is not None:
+                return dict(failure=displacement.failure, numerical=displacement.numerical)
+            return operation(displacement)
+        finally:
+            p.destroy("KSP", outer)
+            displacement.close()
+            p.destroy("Vec", solution)
     probe_windows = context.get("factor_probe_windows")
     probe_inputs = context.get("factor_probe_inputs")
     probe_capture = context.get("factor_probe_capture")
@@ -347,27 +371,43 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     models = (context or {}).get("students", {})
     shell = callback = None
     apply_times = []
-    observed = (context or {}).get("capture_inputs")
+    observed = context.get("capture_inputs")
+    capture_calls = context.get("capture_apply_calls")
+    capture_calls = frozenset(capture_calls) if capture_calls is not None else None
+    stride = context.get("factor_profile_stride", 0)
+    profile_seconds, profile_wall = {}, []
     short_lengths = (context or {}).get("short_krylov")
     factor_feedback = (context or {}).get("factor_feedback")
     capture_probes = probe_capture is not None or (factor_feedback is not None and probe_inputs is None)
     residual_samples = {} if short_lengths or capture_probes else None
     if failure is None:
         action = displacement.apply
-        if observed is not None:
+        if observed is not None or stride:
             def action(source, target):
                 call = len(apply_times)
-                if call in (0, 8, 24, 48) or call % 32 == 0:
-                    residual = p.array(source)
-                    if call >= 64 and observed and observed[-1][0] >= 64:
-                        observed[-1] = call, residual
-                    else:
-                        observed.append((call, residual))
-                displacement.apply(source, target)
+                if observed is not None:
+                    if capture_calls is not None:
+                        if call in capture_calls:
+                            observed.append((call, p.array(source)))
+                    elif call in (0, 8, 24, 48) or call % 32 == 0:
+                        pair = call, p.array(source)
+                        if call >= 64 and observed and observed[-1][0] >= 64:
+                            observed[-1] = pair
+                        else:
+                            observed.append(pair)
+                if stride and call % stride == 0:
+                    start = time.perf_counter()
+                    p.assign(target, displacement.correction(p.array(source), profile=profile_seconds))
+                    profile_wall.append(time.perf_counter()-start)
+                else:
+                    displacement.apply(source, target)
         shell, callback = replay.pcapply_shell(p, child, operator, k, action, apply_times)
         replay.setup_solver(p, outer, fs, options)
-        setup_s = p.maximum(time.perf_counter()-begin)
+        setup_end = time.perf_counter()
+        setup_s = p.maximum(setup_end-begin)
         apply_times.clear()
+        profile_seconds.clear()
+        profile_wall.clear()
         if observed is not None:
             observed.clear()
         if export_level:
@@ -387,7 +427,8 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
                 p.destroy("Vec", solution)
         if residual_samples is not None or context.get("factor_policy") is not None or \
                 config["stage"] == "rl" or config.get("student_cycle") in (
-                "tune", "factor_tune", "factor_search"):
+                "tune", "factor_tune", "factor_search", "factor_operator", "factor_compare",
+                "factor_replay_train", "factor_compress", "factor_cost"):
             result = solve_with_deadline(p, replay, outer, full, rhs, solution,
                 config["max_iterations"], max(config["atol"], config["rtol"]*rhs_norm),
                 begin+config["training"]["episode_timeout_seconds"], residual_samples)
@@ -397,9 +438,23 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
         result["total_wall_s"] = p.maximum(result.pop("_solve_end_time")-begin)
         failure = "episode_timeout" if result.get("timed_out") else (None if result["reached_true_target"] else "gmres_true_residual")
     else:
-        setup_s = p.maximum(time.perf_counter()-begin)
+        setup_end = time.perf_counter()
+        setup_s = p.maximum(setup_end-begin)
         result = dict(reached_true_target=False, total_wall_s=setup_s)
     full_apply_count, full_apply_seconds = len(apply_times), sum(apply_times)
+    if profile_setup:
+        labels = ("outer_fieldsplit_setup_s", "displacement_hierarchy_setup_s", "ksp_setup_s")
+        spans = np.diff([begin, outer_ready, hierarchy_ready, setup_end])
+        result["setup_breakdown"] = dict(zip(labels, p.reduce(spans, "max").tolist()))
+    if profile_wall:
+        labels = sorted(profile_seconds)
+        local = [sum(profile_wall), *(profile_seconds[key] for key in labels)]
+        observed_times = p.gather_equal(local)
+        rank = int(np.argmax(observed_times[:, 0]))
+        wall, *parts = observed_times[rank].tolist()
+        result["displacement_apply_profile"] = dict(
+            count=len(profile_wall), stride=stride, rank=rank, sampled_wall_s=wall,
+            components_s=dict(zip(labels, parts)), remaining_s=max(0., wall-sum(parts)))
     if context.get("factor_probe_only"):
         p.destroy("KSP", outer)
         displacement.close()

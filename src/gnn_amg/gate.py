@@ -215,10 +215,11 @@ def fixed_first_cross(config, p, legacy, bridge, k, cached, teacher, lo, hi):
         direct.close()
 
 
-def checked_hierarchy(config, p, legacy, first, second):
+def checked_hierarchy(config, p, legacy, first, second, offline_teacher=False):
     stats = second.stats
-    if any(stats[k] for k in ("repair_budget_exhausted", "uncovered_free_rows",
-                              "empty_free_rows", "injection_error")):
+    gaps = stats["verified_source_empty_rows"] if offline_teacher else 0
+    if (any(stats[k] for k in ("repair_budget_exhausted","injection_error"))
+            or any(stats[k]!=gaps for k in ("uncovered_free_rows","empty_free_rows"))):
         return None, "second_interpolation_coverage_or_injection"
     if second.owners[-1] > config["terminal_max_dofs"]:
         return None, "terminal_size_limit"
@@ -269,7 +270,9 @@ def retained_pair(config, p, legacy, bridge, k, pair, components, model, control
 
 
 def run_method(config, p, replay, legacy, bridge, row, layout, data, method, teacher,
-               probe_inputs=None, probe_windows=None):
+               probe_inputs=None, probe_windows=None, displacement_inputs=None):
+    from .backend import displacement_correction
+
     old = Path(config["baseline_directory"])
     md, rows, full, rhs, initial = data
     solution = p.vector(full)
@@ -305,6 +308,12 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
                                    nnz=int(p.reduce([space.t0.cpu.nnz])[0]))
             stats["level2"] = dict(coarse_dofs=space.structure["level_dofs"][2],
                                    nnz=int(p.reduce([space.t1.cpu.nnz])[0]))
+        elif method == "factor_teacher":
+            from .factorized import rebuild_teacher_products
+
+            first,second,source = rebuild_teacher_products(config,p,legacy,bridge,row,layout,teacher["fields"],k)
+            stats.update(level1=first.stats,level2=second.stats,teacher_source=source)
+            space,failure = checked_hierarchy(config,p,legacy,first,second,offline_teacher=True)
         elif method in ("teacher_roundtrip", "direct_p1"):
             first, second, stats, failure = retained_pair(config, p, legacy, bridge, k,
                 teacher["pair"], layout["component"], teacher.get("direct_model"), teacher.get("direct_control"),
@@ -414,10 +423,7 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
                     if calls in capture_calls:
                         capture.append(residual.copy())
                     calls += 1
-                answer = local.apply(residual)
-                answer += space.gain(residual - fine(answer))
-                answer += 0.5 * local.apply(residual - fine(answer))
-                p.assign(z, answer)
+                p.assign(z, displacement_correction(local, space, fine, residual))
 
             shell, callback = replay.pcapply_shell(p, child, operator, k, action, apply_times)
     replay.setup_solver(p, outer, fs, options)
@@ -431,7 +437,11 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
         space.direction_samples = []
         if config.get("direct_teacher_kind") in ("E", "F"):
             space.direction_sample_calls = tuple(config["direct_sample_calls"])
-    if probe_inputs is not None:
+    if displacement_inputs is not None:
+        result = dict(action_targets=[displacement_correction(local, space, fine, residual)
+                                      for residual in displacement_inputs] if failure is None else [],
+                      failure=failure)
+    elif probe_inputs is not None:
         from .krylov import probe_trajectories
 
         began = time.perf_counter()
