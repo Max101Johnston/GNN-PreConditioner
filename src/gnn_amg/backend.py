@@ -234,16 +234,21 @@ class Hierarchy:
         self.direction_calls = 0
         self.direction_sample_calls = (0, 2, 6, 14)
 
-    def gain(self, residual):
+    def gain(self, residual, tape=None):
         a, b = self.first, self.second
         rhs = a.P(residual, transpose=True)
-        answer = self.middle.apply(rhs)
-        small = b.P(rhs - a.K(answer), transpose=True)
+        pre = self.middle.apply(rhs)
+        defect = rhs - a.K(pre)
+        small = b.P(defect, transpose=True)
         global_rhs = self.p.all_rows(small, b.owners)
         correction = self.solve(self.factor, global_rhs)
         lo, hi = map(int, b.owners[self.p.rank:self.p.rank+2])
-        answer += b.P(correction[lo:hi])
-        answer += self.middle.apply(rhs - a.K(answer))
+        coarse = correction[lo:hi]
+        middle = pre + b.P(coarse)
+        post = self.middle.apply(rhs - a.K(middle))
+        answer = middle + post
+        if tape is not None:
+            tape.extend((residual, pre, defect, coarse, middle, post, answer))
         if self.direction_samples is not None:
             if self.direction_calls in self.direction_sample_calls:
                 self.direction_samples.append((answer.copy(), correction[lo:hi].copy()))
@@ -359,7 +364,8 @@ def pooled_attributes(p, level, attributes, bridge=None):
     lo, hi = map(int, level.owners[p.rank:p.rank+2])
     return means[lo:hi].copy(), mass[lo:hi].copy()
 
-def solve_with_deadline(p, replay, outer, matrix, rhs, solution, cap, true_limit, deadline):
+def solve_with_deadline(p, replay, outer, matrix, rhs, solution, cap, true_limit, deadline,
+                        residual_samples=None):
     """Same full-system true-residual stop, with a collective wall-clock limit."""
     build, work = p.vector(matrix), p.vector(matrix)
     history, errors = [], []
@@ -370,6 +376,11 @@ def solve_with_deadline(p, replay, outer, matrix, rhs, solution, cap, true_limit
             p.call("MatMult", matrix, current, work)
             p.call("VecAYPX", work, -1., rhs)
             residual = p.norm(work)
+            if residual_samples is not None and np.isfinite(residual) and residual > true_limit:
+                if iteration in (0, 8, 24):
+                    residual_samples[int(iteration)] = (int(iteration), p.array(work))
+                if iteration >= 16 and iteration % 8 == 0:
+                    residual_samples["late"] = (int(iteration), p.array(work))
             overdue = p.maximum(float(time.perf_counter() > deadline)) > 0
             history.append(dict(iteration=int(iteration),
                 internal_norm=float(internal) if np.isfinite(internal) else None,

@@ -268,7 +268,8 @@ def retained_pair(config, p, legacy, bridge, k, pair, components, model, control
     return first, second, stats, None
 
 
-def run_method(config, p, replay, legacy, bridge, row, layout, data, method, teacher):
+def run_method(config, p, replay, legacy, bridge, row, layout, data, method, teacher,
+               probe_inputs=None, probe_windows=None):
     old = Path(config["baseline_directory"])
     md, rows, full, rhs, initial = data
     solution = p.vector(full)
@@ -430,10 +431,17 @@ def run_method(config, p, replay, legacy, bridge, row, layout, data, method, tea
         space.direction_samples = []
         if config.get("direct_teacher_kind") in ("E", "F"):
             space.direction_sample_calls = tuple(config["direct_sample_calls"])
-    if failure:
+    if probe_inputs is not None:
+        from .krylov import probe_trajectories
+
+        began = time.perf_counter()
+        result = dict(trajectories=probe_trajectories(p, full, fs, probe_inputs, probe_windows)
+                      if not failure else {}, failure=failure,
+                      probe_s=p.maximum(time.perf_counter()-began))
+    elif failure:
         result = dict(reached_true_target=False, failure=failure)
     else:
-        if config["stage"] == "rl":
+        if config["stage"] == "rl" or config.get("student_cycle") == "factor_tune":
             from .backend import solve_with_deadline
             result = solve_with_deadline(p, replay, outer, full, rhs, solution,
                 config["max_iterations"], max(1e-12, 1e-8*rhs_norm),

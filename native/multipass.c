@@ -6,6 +6,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
+#include <petsc/private/pcimpl.h>
 
 _Static_assert(PETSC_VERSION_MAJOR == 3 && PETSC_VERSION_MINOR == 16 &&
                    PETSC_VERSION_SUBMINOR == 3, "PETSc ABI mismatch");
@@ -481,5 +483,89 @@ PetscErrorCode gnn_local_nnz(Mat a, double *nnz)
     MatInfo info;
     PetscErrorCode ierr = MatGetInfo(a, MAT_LOCAL, &info);CHKERRQ(ierr);
     *nnz = info.nz_used;
+    return 0;
+}
+
+
+/* Read-only extraction of the executed BoomerAMG V-cycle. In the pinned
+ * PETSc 3.16.3 PC_HYPRE layout the first member is HYPRE_Solver. The public
+ * PCGetCoarseOperators/PCGetInterpolations would transfer ownership and
+ * invalidate the live phase PC, so this bridge copies the numerical arrays. */
+static PetscErrorCode phase_data(PC pc, hypre_ParAMGData **data)
+{
+    PetscBool is_hypre;
+    const char *kind = NULL;
+    HYPRE_Solver solver = NULL;
+    MPI_Comm comm = PetscObjectComm((PetscObject)pc);
+    PetscErrorCode ierr = PetscObjectTypeCompare((PetscObject)pc, PCHYPRE, &is_hypre);CHKERRQ(ierr);
+    if (!is_hypre || !pc->data)
+        SETERRQ(comm, PETSC_ERR_ARG_WRONGSTATE, "Expected an initialized PCHYPRE");
+    ierr = PCHYPREGetType(pc, &kind);CHKERRQ(ierr);
+    if (!kind || strcmp(kind, "boomeramg"))
+        SETERRQ(comm, PETSC_ERR_SUP, "Expected the recorded BoomerAMG phase PC");
+    memcpy(&solver, pc->data, sizeof(solver));
+    *data = (hypre_ParAMGData *)solver;
+    if (!*data || !hypre_ParAMGDataAArray(*data))
+        SETERRQ(comm, PETSC_ERR_ARG_WRONGSTATE, "BoomerAMG phase hierarchy is absent");
+    return 0;
+}
+
+PetscErrorCode gnn_phase_levels(PC pc, PetscInt *levels)
+{
+    hypre_ParAMGData *data = NULL;
+    PetscErrorCode ierr = phase_data(pc, &data);CHKERRQ(ierr);
+    MPI_Comm comm = PetscObjectComm((PetscObject)pc);
+    const HYPRE_Int *relax = hypre_ParAMGDataGridRelaxType(data);
+    const HYPRE_Int *sweeps = hypre_ParAMGDataNumGridSweeps(data);
+    *levels = hypre_ParAMGDataNumLevels(data);
+    if (*levels < 1 || !relax || !sweeps ||
+        hypre_ParAMGDataCycleType(data) != 1 || hypre_ParAMGDataFCycle(data) ||
+        hypre_ParAMGDataMaxIter(data) != 1 || hypre_ParAMGDataTol(data) != 0. ||
+        hypre_ParAMGDataRestriction(data) || hypre_ParAMGDataNumFunctions(data) != 1 ||
+        hypre_ParAMGDataSmoothNumLevels(data) || hypre_ParAMGDataRelaxOrder(data) != 1 ||
+        hypre_ParAMGDataAdditive(data) >= 0 || hypre_ParAMGDataMultAdditive(data) >= 0 ||
+        hypre_ParAMGDataSimple(data) >= 0 ||
+        relax[1] != 6 || relax[2] != 6 || relax[3] != 9 ||
+        sweeps[1] != 1 || sweeps[2] != 1 || sweeps[3] != 1)
+        SETERRQ(comm, PETSC_ERR_SUP, "Unexpected phase BoomerAMG cycle or relaxation settings");
+    for (PetscInt level = 0; level < *levels; ++level)
+        if (hypre_ParAMGDataRelaxWeight(data)[level] != 1. ||
+            hypre_ParAMGDataOmega(data)[level] != 1.)
+            SETERRQ(comm, PETSC_ERR_SUP, "Unexpected phase BoomerAMG relaxation weights");
+    return 0;
+}
+
+PetscErrorCode gnn_phase_level(PC pc, PetscInt level, Mat *matrix, Mat *transfer,
+                               PetscInt *marker_count)
+{
+    hypre_ParAMGData *data = NULL;
+    PetscErrorCode ierr = phase_data(pc, &data);CHKERRQ(ierr);
+    PetscInt levels = hypre_ParAMGDataNumLevels(data);
+    MPI_Comm comm = PetscObjectComm((PetscObject)pc);
+    if (level < 0 || level >= levels)
+        SETERRQ(comm, PETSC_ERR_ARG_OUTOFRANGE, "Invalid phase BoomerAMG level");
+    *marker_count = 0;
+    if (level + 1 < levels)
+    {
+        hypre_IntArray *markers = hypre_ParAMGDataCFMarkerArray(data)[level];
+        if (markers)
+            *marker_count = hypre_IntArraySize(markers);
+        ierr = import_parcsr(hypre_ParAMGDataPArray(data)[level], transfer);CHKERRQ(ierr);
+    }
+    ierr = import_parcsr(hypre_ParAMGDataAArray(data)[level], matrix);CHKERRQ(ierr);
+    return 0;
+}
+
+PetscErrorCode gnn_phase_markers(PC pc, PetscInt level, PetscInt count, PetscInt *output)
+{
+    hypre_ParAMGData *data = NULL;
+    PetscErrorCode ierr = phase_data(pc, &data);CHKERRQ(ierr);
+    if (level < 0 || level + 1 >= hypre_ParAMGDataNumLevels(data))
+        SETERRQ(PetscObjectComm((PetscObject)pc), PETSC_ERR_ARG_OUTOFRANGE, "Invalid phase C/F level");
+    hypre_IntArray *markers = hypre_ParAMGDataCFMarkerArray(data)[level];
+    if (count && (!markers || hypre_IntArraySize(markers) != count))
+        SETERRQ(PetscObjectComm((PetscObject)pc), PETSC_ERR_ARG_SIZ, "Phase C/F layout mismatch");
+    if (count)
+        memcpy(output, hypre_IntArrayData(markers), count*sizeof(PetscInt));
     return 0;
 }

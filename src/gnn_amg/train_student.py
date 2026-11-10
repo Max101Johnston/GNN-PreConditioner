@@ -478,7 +478,418 @@ def train(config):
     record(config, "student_training_complete", job=job, runs=len(reports), device=result["device_name"])
 
 
+class FactorTrainingModel(nn.Module):
+    """The same rank-local graph model with supervised derivatives."""
+    def __init__(self, width, unit_sum_depth=0):
+        super().__init__()
+        from .factorized import layer_sizes
+
+        self.width = width
+        self.unit_sum_depth = unit_sum_depth
+        self.layers = nn.ModuleList(nn.Linear(i, o) for i, o in layer_sizes(width))
+
+    def features(self, frame, valid):
+        fine = self.layers[0](frame["x"]).relu()
+        coarse = self.layers[0](frame["coarse"]).relu()
+        width = self.width
+        weight, bias = self.layers[2].weight, self.layers[2].bias
+        hidden = ((fine @ weight[:, :width].T)[:, None, :] +
+                  coarse @ weight[:, width:2*width].T +
+                  frame["edge"] @ weight[:, 2*width:].T + bias).relu()
+        summary = (hidden * valid[:, :, None]).sum(1) / valid.sum(1, keepdim=True).clamp_min(1)
+        weight, bias = self.layers[3].weight, self.layers[3].bias
+        refined = (hidden @ weight[:, :width].T +
+                   (summary @ weight[:, width:].T)[:, None, :] + bias).relu()
+        return fine, refined, torch.cat((fine, summary), dim=1)
+
+    def forward(self, frame, valid):
+        fine, refined, budget_features = self.features(frame, valid)
+        return self.layers[1](fine), self.layers[4](refined), self.layers[5](budget_features).ravel()
+
+    def inference_model(self):
+        from .factorized import FactorModel, REGIONS, STAGES
+
+        params = np.concatenate([p.detach().cpu().numpy().ravel() for p in self.parameters()])
+        return FactorModel(self.width, params, np.zeros((STAGES, REGIONS, 6), np.float32),
+                           self.unit_sum_depth)
+
+
+class HardFactorTrainingModel(FactorTrainingModel):
+    """Separate optimizer groups with the same packed deployment network."""
+
+    def __init__(self, width, unit_sum_depth):
+        nn.Module.__init__(self)
+        from .factorized import layer_sizes
+
+        self.width, self.unit_sum_depth = width, unit_sum_depth
+        self.layers = nn.ModuleList(nn.Linear(i, o) for i, o in layer_sizes(width)[:4])
+        self.support = nn.Linear(width, 1)
+        self.signed = nn.Linear(width, 2)
+        self.budget = nn.Linear(2*width, 1)
+
+    def forward(self, frame, valid):
+        fine, refined, budget_features = self.features(frame, valid)
+        return (self.layers[1](fine), torch.cat((self.support(refined), self.signed(refined)), 2),
+                self.budget(budget_features).ravel())
+
+    def optimizer_groups(self, rates):
+        return [dict(name="shared", params=[p for i in (0, 2, 3) for p in self.layers[i].parameters()],
+                     lr=rates["shared"])] + [
+            dict(name=name, params=list(module.parameters()), lr=rates[name])
+            for name, module in (("representatives", self.layers[1]), ("support", self.support),
+                                 ("signed", self.signed), ("budget", self.budget))]
+
+    def inference_model(self):
+        from .factorized import FactorModel, REGIONS, STAGES
+
+        with torch.no_grad():
+            output = torch.cat((self.support.weight, self.signed.weight))
+            bias = torch.cat((self.support.bias, self.signed.bias))
+            parameters = (*self.layers.parameters(), output, bias, *self.budget.parameters())
+            packed = np.concatenate([t.detach().cpu().numpy().ravel() for t in parameters])
+        return FactorModel(self.width, packed, np.zeros((STAGES, REGIONS, 6), np.float32),
+                           self.unit_sum_depth)
+
+    def initialize(self, receipt):
+        from .factorized import load_model
+
+        model = load_model(receipt)
+        if model.width != self.width or model.unit_sum_depth != self.unit_sum_depth or np.any(model.adapters):
+            raise ValueError("Incompatible hard pretraining initializer")
+        groups = [(layer, weight, bias) for layer, (weight, bias) in zip(self.layers, model.layers)]
+        output, bias = model.layers[4]
+        groups += [(self.support, output[:1], bias[:1]), (self.signed, output[1:], bias[1:]),
+                   (self.budget, *model.layers[5])]
+        with torch.no_grad():
+            for layer, weight, bias in groups:
+                layer.weight.copy_(torch.as_tensor(weight, device=layer.weight.device))
+                layer.bias.copy_(torch.as_tensor(bias, device=layer.bias.device))
+
+
+def factor_decode(outputs, quota, valid, same):
+    from .factorized import MAX_SUPPORT
+
+    score = torch.round(CONTEXT_SCORE_SCALE * outputs[:, :, 0]).masked_fill(~valid, -torch.inf)
+    anchor = score.masked_fill(~same, -torch.inf).argmax(1)
+    positions = torch.arange(score.shape[0], device=score.device)
+    ordered = score.clone()
+    ordered[positions, anchor] = torch.where((same & valid).any(1), torch.inf, score[positions, anchor])
+    order = torch.argsort(ordered, dim=1, descending=True, stable=True)
+    quota = torch.round(CONTEXT_SCORE_SCALE * quota) / CONTEXT_SCORE_SCALE
+    budget = (3.5 + quota).floor().clamp(1, MAX_SUPPORT)
+    top = torch.arange(order.shape[1], device=order.device) < budget[:, None]
+    return torch.zeros_like(valid).scatter_(1, order, top) & valid
+
+
+def factor_weights(outputs, keep, same, unit_row_sum=False):
+    logits = outputs[:, :, 1].clamp(-12, 12)
+    # A fixed finite shift prevents NaN derivatives on inactive rows.
+    primary = keep * same
+    if unit_row_sum:
+        primary = torch.where(primary.any(1, keepdim=True), primary, keep)
+    exp = (logits - 12).exp() * primary
+    base = exp / exp.sum(1, keepdim=True).clamp_min(1e-30)
+    signed = keep * (.75 * outputs[:, :, 2].tanh())
+    if unit_row_sum:
+        signed = signed - keep * signed.sum(1, keepdim=True) / keep.sum(1, keepdim=True).clamp_min(1)
+    return base + signed
+
+
+def factor_loss(model, frame, hard, stage=0, teacher_weight=0.):
+    from torch.nn import functional as F
+
+    valid = frame["online"] if hard else frame["valid"]
+    rep, out, quota = model(frame, valid)
+    selected = frame["selected"]
+    binary = F.binary_cross_entropy_with_logits(rep[:, 0], selected.float(), reduction="none")
+    rep_loss = .5 * ((binary * selected).sum()/selected.sum().clamp_min(1) +
+                     (binary * ~selected).sum()/(~selected).sum().clamp_min(1))
+    rep_loss += .25 * F.smooth_l1_loss(rep[:, 1], frame["quota"]-2)
+    labels = (frame["target"] != 0) & valid
+    active = frame["active"]
+    mask = valid & active[:, None]
+    edge_bce = F.binary_cross_entropy_with_logits(out[:, :, 0], labels.float(), reduction="none")
+    positive = labels & mask
+    negative = ~labels & mask
+    support = .5*((edge_bce * positive).sum()/positive.sum().clamp_min(1) +
+                  (edge_bce * negative).sum()/negative.sum().clamp_min(1))
+    choice = factor_decode(out, quota, valid, frame["same"]) if hard else labels
+    unit_row_sum = stage < model.unit_sum_depth
+    weights = factor_weights(out, choice, frame["same"], unit_row_sum)
+    if hard:
+        # Forward uses precisely the exported hard decode. Selection also sees
+        # a smooth local proxy of the signed/action errors in the backward pass.
+        threshold = (out[:, :, 0] * choice).sum(1) / choice.sum(1).clamp_min(1)
+        soft = torch.sigmoid((out[:, :, 0]-threshold.detach()[:, None] +
+                             .35*(quota-quota.detach())[:, None])/.3) * valid
+        if model.unit_sum_depth:
+            # Keep the selection gradient bounded when soft gates nearly
+            # vanish. Only the sigmoid gates carry derivatives here.
+            relaxed = .2 * soft * factor_weights(out.detach(), valid, frame["same"], unit_row_sum)
+        else:
+            relaxed = factor_weights(out.detach(), soft, frame["same"])
+        weights = weights + (relaxed - relaxed.detach())
+    target = frame["target"]
+    normalization = target.square().sum(1).clamp_min(.04)
+    signed = ((weights-target).square().sum(1)/normalization * active).sum()/active.sum().clamp_min(1)
+    effect = (weights[:, :, None] * frame["probes"]).sum(1)
+    expected = frame["action"]
+    action = ((effect-expected).square().sum(1)/expected.square().sum(1).clamp_min(.04)
+              * active).sum()/active.sum().clamp_min(1)
+    budget = (F.smooth_l1_loss(quota, labels.sum(1).float().clamp_min(1)-3, reduction="none")
+              * active).sum()/active.sum().clamp_min(1)
+    loss = signed + .3 * action + support + rep_loss + .15 * budget
+    if teacher_weight:
+        # The auxiliary teacher can order only real candidates, and has the
+        # same row budget as the hard model. The main loss always uses choice.
+        teacher_choice = factor_decode(target.abs()[:, :, None], quota.detach(), valid, frame["same"])
+        teacher_weights = factor_weights(out, teacher_choice, frame["same"], unit_row_sum)
+        warm = ((teacher_weights-target).square().sum(1)/normalization * active).sum()/active.sum().clamp_min(1)
+        loss = loss + teacher_weight * warm
+    return loss, torch.stack((loss, signed, action, support, rep_loss, budget))
+
+
+def factor_parity(model, frame, stage=0):
+    from .factorized import coefficients, support_mask
+
+    device = next(model.parameters()).device
+    values = {name: torch.as_tensor(value[:96], device=device) for name, value in frame.items()}
+    x = frame["x"][:96]
+    valid = frame["online"][:96]
+    same = frame["same"][:96]
+    with torch.no_grad():
+        rep, outputs, quota = model(values, values["online"])
+        chosen = factor_decode(outputs, quota, values["online"], values["same"])
+        unit_row_sum = stage < model.unit_sum_depth
+        trained = factor_weights(outputs, chosen, values["same"], unit_row_sum).cpu().numpy()
+    native = model.inference_model()
+    regions = np.zeros(len(x), np.int32)
+    fine, logits = native.node_outputs(x, stage, regions)
+    coarse = np.maximum(0, native.linear(0, frame["coarse"][:96]))
+    outputs_np, budget = native.edge_outputs(fine, coarse, frame["edge"][:96], valid, stage, regions)
+    keep = support_mask(outputs_np[:, :, 0], budget, valid, same)
+    np.testing.assert_array_equal(keep, chosen.cpu().numpy())
+    np.testing.assert_allclose(logits, rep.cpu().numpy(), atol=2e-5, rtol=2e-5)
+    actual = coefficients(outputs_np[:, :, 1], outputs_np[:, :, 2], keep, same, unit_row_sum)
+    np.testing.assert_allclose(actual, trained, atol=2e-5, rtol=2e-5)
+    return dict(exact_support=True, rows=len(x),
+                max_coefficient_difference=float(np.max(np.abs(actual-trained))),
+                max_score_difference=float(np.max(np.abs(outputs_np[:, :, 0]-outputs[:, :, 0].cpu().numpy()))),
+                max_quota_difference=float(np.max(np.abs(budget-quota.cpu().numpy()))))
+
+
+def load_factor_data(manifests):
+    """Read disjoint, hashed training states in stage order."""
+    from .factorized import STAGES
+
+    data, keys = [], []
+    for manifest in manifests:
+        if digest(manifest["path"]) != manifest["sha256"]:
+            raise ValueError("Factor training manifest changed")
+        report = read_json(manifest["path"])
+        assert report["mode"] == "factor_data" and report["accepted"]
+        for frame in report["frames"]:
+            assert frame["split"] == "training" and frame["key"] not in keys
+            keys.append(frame["key"])
+            shards = []
+            for rank, identity in enumerate(frame["shards"]):
+                path = frame["shard_pattern"] % rank
+                if digest(path) != identity:
+                    raise ValueError("Factor supervision shard changed: " + path)
+                with np.load(path) as archive:
+                    shards.append({k: archive[k] for k in archive.files})
+            for stage in range(STAGES):
+                prefix = "q%d_" % (stage+1)
+                data.append({name[len(prefix):]: np.concatenate([shard[name] for shard in shards])
+                             for name in shards[0] if name.startswith(prefix)})
+    return data, keys
+
+
+def train_factors(config):
+    from .factorized import STAGES, save_model
+
+    begin = time.perf_counter()
+    output = Path(config["output_directory"])
+    job = os.environ["SLURM_JOB_ID"]
+    settings = config["factorized"]
+    seed, epochs = settings["seed"], settings["epochs"]
+    device = torch.device(config["student_train_device"])
+    torch.set_num_threads(config["student_train_threads"])
+    torch.set_num_interop_threads(1)
+    torch.manual_seed(seed)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    manifest = config["factor_dataset"]
+    data, _ = load_factor_data([manifest])
+    model = FactorTrainingModel(settings["width"], settings.get("unit_sum_depth", 0)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=settings["fit_lr"])
+    rng = np.random.default_rng(seed)
+    history = []
+    for epoch in range(epochs):
+        hard = epoch >= max(1, epochs//4)
+        lr = settings.get("hard_fit_lr", settings["fit_lr"]) if hard else settings["fit_lr"]
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        aggregate = torch.zeros(6, device=device)
+        batches = 0
+        for index in rng.permutation(len(data)):
+            frame = data[index]
+            order = rng.permutation(len(frame["x"]))
+            for start in range(0, len(order), settings["batch_rows"]):
+                rows = order[start:start+settings["batch_rows"]]
+                batch = {name: torch.as_tensor(value[rows], device=device)
+                         for name, value in frame.items()}
+                optimizer.zero_grad(set_to_none=True)
+                loss, values = factor_loss(model, batch, hard, stage=index % STAGES)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2., error_if_nonfinite=True)
+                optimizer.step()
+                aggregate += values.detach()
+                batches += 1
+        values = (aggregate / batches).cpu().tolist()
+        metrics = dict(zip(("loss", "signed", "composition_action", "support",
+                            "representatives", "budget"), values))
+        history.append(dict(epoch=epoch+1, hard_support=hard, learning_rate=lr, **metrics))
+        record(config, "factor_pretraining_epoch", job=job, **history[-1])
+    # Retain the fitted weights for diagnostics if the export check fails.
+    # The successful receipt is written only after all parity checks pass.
+    checkpoint = save_model(output/"checkpoints"/("factorized-"+job+".npz"), model.inference_model())
+    parity = [factor_parity(model, data[stage], stage) for stage in range(STAGES)]
+    result = dict(job=job, model=checkpoint, native_parity=parity, dataset=manifest,
+                  device_name=torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU",
+                  samples=sum(len(x["x"]) for x in data), epochs=history,
+                  elapsed_seconds=time.perf_counter()-begin)
+    with (output/"records"/("student-trained-"+job+".json")).open("x") as stream:
+        json.dump(result, stream, allow_nan=False, indent=2)
+    record(config, "factor_pretraining_complete", job=job, model=checkpoint, samples=result["samples"])
+
+
+def hard_teacher_audit(model, fixed, device):
+    """Measure teacher retention with actual candidates, scores and budgets."""
+    from .factorized import STAGES
+
+    totals = np.zeros((STAGES, 9), np.float64)
+    with torch.no_grad():
+        for stage, values, rows in fixed:
+            frame = {key: torch.as_tensor(x[rows], device=device) for key, x in values.items()}
+            valid, target, active = frame["online"], frame["target"], frame["active"]
+            _, outputs, quota = model(frame, valid)
+            teacher_scores = target.abs()[:, :, None]
+            own = factor_decode(outputs, quota, valid, frame["same"])
+            oracle = factor_decode(teacher_scores, quota, valid, frame["same"])
+            expected = frame["action"]
+            energy = target.square()
+            error = ((target[:, :, None]*oracle[:, :, None]*frame["probes"]).sum(1)-expected).square()
+            actual = factor_weights(outputs, own, frame["same"], stage < model.unit_sum_depth)
+            stats = torch.stack(((energy*active[:, None]).sum(),
+                (energy*active[:, None]*valid).sum(), (energy*active[:, None]*oracle).sum(),
+                (energy*active[:, None]*own).sum(), (error*active[:, None]).sum(),
+                (expected.square()*active[:, None]).sum(), active.sum(),
+                (own*active[:, None]).sum(), ((actual != 0)*active[:, None]).sum()))
+            totals[stage] += stats.cpu().numpy()
+    return [dict(stage=stage+1, rows=int(n),
+                 candidate_energy=float(candidate/max(mass, 1e-30)),
+                 teacher_on_deployed_budget_energy=float(oracle/max(mass, 1e-30)),
+                 teacher_on_model_support_energy=float(learned/max(mass, 1e-30)),
+                 teacher_on_deployed_budget_action_relative=float(np.sqrt(error/max(norm, 1e-30))),
+                 selected_per_active_row=float(support/max(n, 1)),
+                 nonzero_per_active_row=float(nonzero/max(n, 1)))
+            for stage, (mass, candidate, oracle, learned, error, norm, n, support, nonzero) in enumerate(totals)]
+
+
+def train_hard_factors(config):
+    from .factorized import STAGES, save_model
+
+    started = time.perf_counter()
+    output = Path(config["output_directory"])
+    job = os.environ["SLURM_JOB_ID"]
+    settings, hard = config["factorized"], config["factor_hard"]
+    device = torch.device(config["student_train_device"])
+    torch.set_num_threads(config["student_train_threads"])
+    torch.set_num_interop_threads(1)
+    torch.manual_seed(settings["seed"])
+    torch.backends.cuda.matmul.allow_tf32 = False
+    manifests = config["factor_datasets"]
+    data, keys = load_factor_data(manifests)
+    if set(keys) != set(hard["training_keys"]):
+        raise ValueError("Hard pretraining data does not match the frozen training-state list")
+    model = HardFactorTrainingModel(settings["width"], settings["unit_sum_depth"]).to(device)
+    if "initialize" in hard:
+        model.initialize(hard["initialize"])
+    rates = hard["learning_rates"]
+    optimizer = torch.optim.AdamW(model.optimizer_groups(rates))
+    rng = np.random.default_rng(settings["seed"])
+    fixed, optimization = [], []
+    for index, frame in enumerate(data):
+        rows = np.arange(len(frame["x"]))
+        # Use a fixed disjoint row sample in every state and stage.
+        selected = np.sort(rng.choice(rows, min(len(rows)//8, hard["audit_rows"]), replace=False))
+        fixed.append((index % STAGES, frame, selected))
+        optimization.append(np.setdiff1d(rows, selected, assume_unique=True))
+
+    metrics = ("loss", "signed", "composition_action", "support", "representatives", "budget")
+    def measure():
+        model.eval()
+        values = torch.zeros(len(metrics), device=device)
+        n = 0
+        with torch.no_grad():
+            for stage, frame, rows in fixed:
+                if len(rows):
+                    batch = {key: torch.as_tensor(x[rows], device=device) for key, x in frame.items()}
+                    _, stats = factor_loss(model, batch, True, stage)
+                    values += stats*len(rows)
+                    n += len(rows)
+        if not n:
+            raise ValueError("No held-back hard training rows")
+        return dict(zip(metrics, (values/n).cpu().tolist()))
+
+    initial = measure()
+    before = hard_teacher_audit(model, fixed, device)
+    history = [dict(epoch=0, hard_support=True, teacher_weight=0., hard_metrics=initial)]
+    record(config, "factor_hard_epoch", job=job, **history[-1])
+    best = (initial["signed"]+.3*initial["composition_action"], 0,
+            {key:value.detach().cpu().clone() for key,value in model.state_dict().items()})
+    for epoch in range(hard["epochs"]):
+        model.train()
+        teacher_weight = hard["teacher_weight"] * max(0., 1-epoch/max(1, hard["teacher_warm_epochs"]))
+        for index in rng.permutation(len(data)):
+            frame = data[index]
+            order = rng.permutation(optimization[index])
+            for start in range(0, len(order), settings["batch_rows"]):
+                rows = order[start:start+settings["batch_rows"]]
+                batch = {key: torch.as_tensor(x[rows], device=device) for key, x in frame.items()}
+                optimizer.zero_grad(set_to_none=True)
+                loss, _ = factor_loss(model, batch, True, stage=index % STAGES, teacher_weight=teacher_weight)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2., error_if_nonfinite=True)
+                optimizer.step()
+        scores = measure()
+        history.append(dict(epoch=epoch+1, hard_support=True, teacher_weight=teacher_weight, hard_metrics=scores))
+        record(config, "factor_hard_epoch", job=job, **history[-1])
+        quality = scores["signed"]+.3*scores["composition_action"]
+        if quality < best[0]:
+            best = quality, epoch+1, {key:value.detach().cpu().clone() for key,value in model.state_dict().items()}
+    model.load_state_dict(best[2])
+    checkpoint = save_model(output/"checkpoints"/("factorized-"+job+".npz"), model.inference_model())
+    parity = [factor_parity(model, data[stage], stage) for stage in range(STAGES)]
+    result = dict(job=job, model=checkpoint, native_parity=parity, datasets=manifests,
+        device_name=torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU",
+        samples=sum(len(frame["x"]) for frame in data), training_keys=keys, epochs=history,
+        independent_learning_rates=rates, best_epoch=best[1], best_hard_metrics=history[best[1]]["hard_metrics"],
+        teacher_projection_initial=before, teacher_projection_best=hard_teacher_audit(model, fixed, device),
+        elapsed_seconds=time.perf_counter()-started)
+    with (output/"records"/("student-trained-"+job+".json")).open("x") as stream:
+        json.dump(result, stream, allow_nan=False, indent=2)
+    record(config, "factor_hard_complete", job=job, model=checkpoint, states=len(keys),
+           best_epoch=best[1], hard_metrics=result["best_hard_metrics"])
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
-    train(read_json(parser.parse_args().config))
+    configuration = read_json(parser.parse_args().config)
+    if "factor_hard" in configuration:
+        train_hard_factors(configuration)
+    elif "factor_dataset" in configuration:
+        train_factors(configuration)
+    else:
+        train(configuration)

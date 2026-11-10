@@ -29,12 +29,12 @@ class GalerkinTransfer:
         self.p.destroy("Mat", self.transfer, self.coarse)
 
 
-def imported_transfer(p, legacy, parent, csr, rows, columns, stats):
+def imported_transfer(p, legacy, parent, csr, rows, columns, stats, markers=None):
     # DistributedSparse creates a PETSc matrix independently of the input CSR.
     # Its two temporary work vectors are unnecessary in GalerkinTransfer.
     imported = legacy.DistributedSparse(p, csr, rows, columns)
     p.destroy("Vec", imported.right, imported.left)
-    return GalerkinTransfer(p, parent, imported.matrix, columns, stats)
+    return GalerkinTransfer(p, parent, imported.matrix, columns, stats, markers)
 
 
 def coarse_graph(config, p, bridge, first):

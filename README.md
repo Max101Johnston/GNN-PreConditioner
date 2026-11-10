@@ -1,8 +1,9 @@
 # GNN AMG coarse-DOF selection
 
-This project learns two successive C/F selections. It builds the second graph
-from the actual first Galerkin matrix. Interpolation, coarse operators,
-smoothing and the complete FieldSplit-GMRES solve remain numerical operations.
+This project studies learned AMG coarsening and interpolation. The factorized
+student generates both coarse spaces and their signed interpolation. It builds
+the second graph from the actual first Galerkin matrix. PETSc assembles the
+coarse operators and executes the complete FieldSplit-GMRES solve.
 
 The source tree contains reusable ML code, its numerical bridge, tests and
 documentation. Datasets, generated features, compiled libraries, checkpoints,
@@ -311,3 +312,124 @@ and the final time. The extra fracture diagnostics at integration points
 are disabled. The full linear and timestep diagnostic records are retained.
 Fixed output times also constrain OGS time stepping, so comparisons use the
 same profile for every method.
+
+## Factorized joint interpolation
+
+The factorized student composes three learned local transfers into P1 and two
+more into P2. A shared graph encoder reads signed stiffness neighbours and
+pooled observations. The model ranks representatives in spatial groups, sets
+group and row budgets, and generates signed coefficients on its selected
+support. Distributed quotient graphs carry the intermediate structure. The
+solver uses only P1 and P2, with K1 and K2 assembled from those products.
+
+Run the existing pipeline with an external plan in mode factorized.
+
+    python -B scripts/student-pipeline.py /path/to/analysis/records/plan-factorized.json
+
+The plan lists training-only teacher frames, the frozen base configuration,
+Slurm limits and the existing monitor. The factor_data stage verifies original
+HMIS shards and native maps, rebuilds the products, and checks the effective
+retained cache where present. The comparison restores the cached column
+coordinates and accounts for signed component-sum dropping. Sampled shards
+contain the same graph observations used in deployment, signed local targets,
+and product probes with teacher factors downstream. Extra teacher edges are
+available during the initial coefficient warmup. The final supervision phase
+uses the deployed candidates and hard decoding.
+
+Joint training starts with the resulting checkpoint. Each batch rotates
+training frames and perturbs a shared spatial region across all five stages.
+The paired complete solves update representative, support and budget scores
+and a signed coefficient adapter. Captured PCApply inputs also train the
+coefficient adapter through the student's actual RAS and Galerkin correction.
+The same model and decoder generate both candidate and validation hierarchies.
+
+Validation compares the initial and updated models with the existing student,
+on-demand AMG and the cached retained hierarchy. It measures fresh graph
+generation, selection, transfers, products, Galerkin construction and the full
+true-residual solve. The replay input and resident model weights are outside
+the timed interval. The pipeline repeats competitive results in reversed
+order. An experimental run can complete even if the model misses the speed
+target. The report keeps failure counts, per-frame true residuals, factor
+sizes, construction timing and model identities.
+
+### Hard-support training
+
+The factor_hard pipeline reuses the accepted teacher shards and exports the
+remaining training matrices while the first hard model trains. The pooled fit
+uses every training state. All primary losses use the deployment mask from the
+first step. The brief teacher auxiliary uses the same available candidates and
+row budgets. The shared encoder, representative scores, support scores,
+signed coefficients and budget have independent learning rates. A fixed
+sample of rows from each training state measures deterministic hard quality
+and selects the checkpoint. The fit receipt records teacher coefficient
+retention and the error on composed probe actions after projection onto the
+deployed budget.
+
+The Krylov pilot uses full-system residuals from early and late iterations and
+component-local directions. It compares four, eight and twelve right GMRES
+steps with PETSc using the same FieldSplit and RAS. It also checks the sparse
+ILU(0) forward and transpose actions on the actual first coarse blocks. Small
+directional finite differences exercise the Arnoldi reverse pass and the
+sparse ILU numeric reverse pass.
+
+
+The factor_gradient replay uses the actual mid- and late-solve residuals and a
+rotating displacement component. It differentiates the right-preconditioned
+short GMRES segment through the multiplicative FieldSplit, RAS, both Galerkin
+matrices, middle ILU numerical factors, and all five sparse transfers. The
+small terminal solve uses its transpose factor. The frozen minibatch keeps
+its current hard supports and graph observations. New replay reconstructs
+both coarse matrices and the second-level graph. The pinned numerical bridge
+copies the actual fixed phase V-cycle and its C/F markers. The replay checks
+the reconstructed phase action and the transpose of each full Arnoldi
+operator action. The RAS transpose masks the input on the owned rows before
+the existing local ILU transpose solve, then sums all overlapping outputs.
+A frozen-support finite difference rebuilds all numerical factors
+to verify the coefficient gradient. Paired cold replays use the regular
+decoder and separately record the initial and updated checkpoints.
+
+
+The factor_structure option starts sampled structure updates after verified
+coefficient feedback. Each rollout releases a single ranking slot per sampled
+local group or row, or one row budget. These conditional choices preserve the
+deployment eligibility, anchors, and hard budget limits. Their categorical
+likelihoods update the corresponding network output head using four full
+same-frame solves and a leave-one-out elapsed-time baseline. The checkpoint is
+replayed with deterministic hard decoding on the fixed validation states.
+
+
+The factor_learn cycle extends the same policy over all training matrices,
+alternating structural updates with verified coefficient gradients. It saves
+network weights and optimizer state at each periodic deterministic validation.
+An interrupted run can resume from a hashed milestone receipt using its
+unchanged schedule. The final report replays the two shortlisted checkpoints
+and the established solver baselines in reversed paired order. It records
+cached and on-demand speed comparisons separately.
+
+If a run terminates after its last milestone, recovery reconstructs the
+recorded structural actions without executing their complete solves again.
+It verifies the action likelihoods and signatures before reusing saved
+elapsed-time rewards. The interrupted step is executed from the last verified
+state whenever a reconstruction check fails.
+
+### Search and distillation
+
+The `factor_search` review starts from the retained learned checkpoint. It
+calibrates short right-GMRES prefixes on identical full-system residuals for
+the start, the late checkpoint, and the retained teacher. The coefficient
+objective stops accumulating a gradient on a probe once it meets its target.
+An update uses only the signed output channels and records changes in every
+stage's deterministic support and representatives before admission.
+
+Each round screens the deterministic incumbent, four regional proposals, and
+a separate coefficient proposal when the signed head has a finite nonzero
+gradient. Executed hierarchy fingerprints eliminate repeated full solves.
+Only a repeatable improvement in true-residual time enters the distillation
+bank. KL on the recorded legal candidate sets protects the existing behavior.
+The incumbent is promoted on the same eight validation matrices using paired
+cold construction and solves. The final comparison reverses the order in its
+second repeat and includes the original checkpoint and the signed student.
+
+Select this mode with `stage: review` and `student_cycle: factor_search` in an
+external frozen configuration. The analysis records the probe calibration,
+each round's screen and confirmation outcomes, and the final paired solves.

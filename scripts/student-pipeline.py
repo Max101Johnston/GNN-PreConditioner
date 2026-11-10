@@ -102,7 +102,7 @@ class Pipeline:
         write_state(self.path, self.state)
 
     def update_run(self, phase, job):
-        if self.plan["mode"] in ("direct", "direct_refine", "direct_context"):
+        if self.plan["mode"] in ("direct", "direct_refine", "direct_context", "factorized", "factor_hard"):
             return  # The pilot keeps its own state and frozen configurations.
         path = Path(self.plan["run_record"])
         current = read(path)
@@ -148,7 +148,7 @@ class Pipeline:
                 return fields["NodeName"]
         return None
 
-    def stage(self, phase, updates, training=False):
+    def stage(self, phase, updates, training=False, defer=False):
         entry = self.state["phases"].setdefault(phase,{})
         if training and "device" not in entry:
             node = self.available_gpu() if self.plan.get("prefer_gpu",True) else None
@@ -172,8 +172,13 @@ class Pipeline:
                      "--mem=64G","--time="+self.plan["cpu_train_walltime"]]
         else:
             walltime = "02:30:00" if phase=="tune" else self.plan["solver_walltime"]
-            args += ["--partition=compute","--nodes=3","--ntasks=192","--ntasks-per-node=64",
-                     "--cpus-per-task=1","--mem=128G","--time="+walltime]
+            if phase in ("factors", "pool"):
+                walltime = self.plan["factor_data_walltime"]
+            workers = config["parallel_workers"]
+            ranks = config["mpi_ranks"]
+            assert 1 <= workers and workers*ranks <= config["cpu_limit"]
+            args += ["--partition=compute",f"--nodes={workers}",f"--ntasks={workers*ranks}",
+                     f"--ntasks-per-node={ranks}","--cpus-per-task=1","--mem=128G","--time="+walltime]
         args += [self.base["source_directory"]+"/scripts/run-gate.sh",remote]
         entry.update(config=str(local), config_sha256=sha, argv=args)
         self.save()
@@ -186,11 +191,27 @@ class Pipeline:
         self.state["status"] = "running"
         self.save()
         self.update_run(phase,job)
-        print("STUDENT_PHASE",phase,"SLURM",job,device or "3x64",flush=True)
+        print("STUDENT_PHASE", phase, "SLURM", job, device or
+              "%dx%d" % (config["parallel_workers"], config["mpi_ranks"]), flush=True)
+        if defer:
+            return
+        return self.finish_stage(phase)
+
+    def finish_stage(self, phase):
+        entry = self.state["phases"][phase]
+        local, job, path = entry["config"], entry["job"], entry["artifact"]
+        config = read(local)
+        assert digest(Path(local).read_text()) == entry["config_sha256"]
         self.wait(local,job)
         report = self.remote_json(path)
         assert report["job"] == job
-        if training:
+        training = config["stage"] == "student_train"
+        if training and ("factor_dataset" in config or "factor_hard" in config):
+            assert all(r["exact_support"] for r in report["native_parity"])
+            model = report["model"]
+            assert self.remote(["sha256sum", model["path"]], capture_output=True).split()[0] == model["sha256"]
+            entry.update(model=model, device_name=report["device_name"], elapsed_seconds=report["elapsed_seconds"])
+        elif training:
             exports = [c for r in report["runs"] for c in r["checkpoints"]]
             assert exports and all(c["native_parity"]["exact_support"] for c in exports)
             self.verify_models(exports)
@@ -239,6 +260,10 @@ class Pipeline:
             return self.run_direct_refinement()
         if self.plan["mode"] == "direct_context":
             return self.run_direct_context()
+        if self.plan["mode"] == "factorized":
+            return self.run_factorized()
+        if self.plan["mode"] == "factor_hard":
+            return self.run_hard_factorized()
         reference = dict(name="reference")
         smoke = self.plan["mode"] == "smoke"
         if smoke:
@@ -409,6 +434,109 @@ class Pipeline:
         self.state["status"] = "direct_context_measured"
         self.save()
         print("DIRECT_P1_CONTEXT_MEASURED",self.study,flush=True)
+
+    def reuse_factorized_stage(self, phase, prefix, previous):
+        job = str(previous["job"])
+        assert job.isdigit()
+        accounting = read(self.case/"records"/("wait-"+job+".json"))
+        assert accounting["job_id"] == job and accounting["remote_case"] == self.root
+        assert accounting["state"] == "COMPLETED" and accounting["exit_code"] == "0:0"
+        assert all(item["state"] == "COMPLETED" and item["exit_code"] == "0:0"
+                   for item in accounting["components"])
+        exits = accounting["exit_records"]
+        assert any("MPI exit: 0; logger exit: 0; web filter exit: 0" in line for line in exits)
+        assert any("batch exit: 0" in line for line in exits)
+        path = self.root+"/records/"+prefix+"-"+job+".json"
+        identity = self.remote(["sha256sum", path], capture_output=True).split()[0]
+        assert identity == previous["sha256"]
+        report = self.remote_json(path)
+        assert report["job"] == job
+        self.state["phases"][phase] = dict(job=job, artifact=path, artifact_sha256=identity,
+                                           status="verified_reused")
+        self.save()
+        print("STUDENT_PHASE", phase, "REUSED_SLURM", job, flush=True)
+        return report, path
+
+    def run_hard_factorized(self):
+        """Expand the training states while the initial hard model is fitted."""
+        reuse = self.plan["reuse_factorized"]
+        seed, seed_path = self.reuse_factorized_stage("factors", "student-cycle", reuse["factors"])
+        keys = self.plan["teacher_keys"]
+        assert seed["accepted"] and set(seed["keys"]) <= set(keys)
+        seed_manifest = dict(path=seed_path, sha256=reuse["factors"]["sha256"])
+        extra = [key for key in keys if key not in seed["keys"]]
+        if "pool" in reuse:
+            pool, pool_path = self.reuse_factorized_stage("pool", "student-cycle", reuse["pool"])
+        else:
+            self.stage("pool", dict(student_cycle="factor_data", student_keys=extra, gate_keys=[],
+                       mpi_timeout_seconds=self.plan["data_timeout_seconds"]), defer=True)
+        if "warm" in reuse:
+            warm, _ = self.reuse_factorized_stage("warm", "student-trained", reuse["warm"])
+            assert warm["datasets"] == [seed_manifest] and all(x["exact_support"] for x in warm["native_parity"])
+        else:
+            warm, _ = self.stage("warm", dict(factor_datasets=[seed_manifest],
+                factor_hard=dict(self.base["factor_hard"], training_keys=seed["keys"],
+                                 epochs=self.plan["warm_epochs"])), training=True)
+        if "pool" not in reuse:
+            pool, pool_path = self.finish_stage("pool")
+        assert pool["accepted"] and set(pool["keys"]) == set(extra)
+        manifests = [seed_manifest, dict(path=pool_path,
+            sha256=self.remote(["sha256sum", pool_path], capture_output=True).split()[0])]
+        fit, artifact = self.stage("fit", dict(factor_datasets=manifests,
+            factor_hard=dict(self.base["factor_hard"], training_keys=keys,
+                             initialize=warm["model"], teacher_weight=0.)), training=True)
+        assert set(fit["training_keys"]) == set(keys)
+        result, diagnostics = self.stage("krylov", dict(student_cycle="factor_krylov",
+            factor_model=fit["model"], student_keys=self.base["gate_keys"][:2]))
+        assert result["completed"] and len(result["cases"]) == 2
+        self.state["final"] = dict(model=fit["model"], hard_fit=artifact, training_states=len(keys),
+            hard_metrics=fit["best_hard_metrics"], krylov=diagnostics, krylov_cases=result["cases"])
+        self.state["status"] = "factor_hard_measured"
+        self.save()
+        print("FACTORIZED_HARD_MEASURED", self.study, flush=True)
+
+    def run_factorized(self):
+        keys = self.plan["teacher_keys"]
+        reuse = self.plan.get("reuse_factorized", {})
+        if "factors" in reuse:
+            dataset, path = self.reuse_factorized_stage("factors", "student-cycle", reuse["factors"])
+        else:
+            dataset, path = self.stage("factors", dict(student_cycle="factor_data", student_keys=keys))
+        assert dataset["accepted"] and set(dataset["keys"]) == set(keys)
+        self.state["phases"]["factors"]["teacher_frames"] = len(keys)
+        self.state["phases"]["factors"]["cached_compositions"] = sum(
+            row["cache"] is not None for row in dataset["frames"])
+        self.save()
+        identity = self.remote(["sha256sum", path], capture_output=True).split()[0]
+        manifest = dict(path=path, sha256=identity)
+        if "fit" in reuse:
+            fit, _ = self.reuse_factorized_stage("fit", "student-trained", reuse["fit"])
+            assert fit["dataset"] == manifest and all(row["exact_support"] for row in fit["native_parity"])
+            model = fit["model"]
+            assert self.remote(["sha256sum", model["path"]], capture_output=True).split()[0] == model["sha256"]
+            self.state["phases"]["fit"]["model"] = model
+            self.save()
+        else:
+            fit, _ = self.stage("fit", dict(factor_dataset=manifest), training=True)
+        result, artifact = self.stage("joint", dict(student_cycle="factor_tune", factor_model=fit["model"],
+            factor_reference=self.base["direct_student_control"],
+            mpi_timeout_seconds=self.plan["joint_timeout_seconds"]))
+        totals = result["totals"]
+        model = result["model"]
+        assert self.remote(["sha256sum", model["path"]], capture_output=True).split()[0] == model["sha256"]
+        repeats = result["repeat_totals"]
+        comparisons = {name: len(repeats) >= 2 and all(
+            not r["joint"]["failed"] and not r[name]["failed"] and
+            r["joint"]["total_s"] < r[name]["total_s"] for r in repeats)
+            for name in ("student", "amg", "retained_base")}
+        speed_gate = result["joint_updates"] > 0 and comparisons["student"] and comparisons["amg"]
+        self.state["final"] = dict(model=model, initial_model=fit["model"], report=artifact,
+            joint_updates=result["joint_updates"], training_frames=result["training_frames"],
+            validation_keys=result["keys"], validation=totals, repeat_totals=repeats,
+            repeatable_speedups=comparisons, target_speed_gate=speed_gate)
+        self.state["status"] = "factorized_measured"
+        self.save()
+        print("FACTORIZED_JOINT_MEASURED", self.study, flush=True)
 
     def finish_full(self, reference, dev, p1, p2):
         valid = self.base["training"]["validation_keys"]

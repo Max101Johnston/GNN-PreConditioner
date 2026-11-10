@@ -15,7 +15,8 @@ import time
 import numpy as np
 
 from .backend import (Action, Hierarchy, Level, digest, graph_features, load_bridge,
-    load_dependencies, local_csr, pooled_attributes, read_json, record, solve_with_deadline, strength_graph)
+    load_dependencies, local_csr, ownership, pooled_attributes, read_json, record, solve_with_deadline,
+    strength_graph)
 from .dataset import gather_array, gather_graph, physical_attributes
 from .inference import PolicyClient, connection_prior, graph_decode, load_selector
 
@@ -96,12 +97,14 @@ class DisplacementPC:
     timings: dict
     failure: object
 
-    def apply(self, source, target):
-        residual = self.p.array(source)
+    def correction(self, residual, tape=None):
         answer = self.local.apply(residual)
-        answer += self.space.gain(residual - self.fine(answer))
+        answer += self.space.gain(residual - self.fine(answer), tape)
         answer += .5 * self.local.apply(residual - self.fine(answer))
-        self.p.assign(target, answer)
+        return answer
+
+    def apply(self, source, target):
+        self.p.assign(target, self.correction(self.p.array(source)))
 
     def close(self):
         seen = set()
@@ -112,6 +115,65 @@ class DisplacementPC:
                 seen.add(id(item))
 
 
+def finish_hierarchy(config, p, legacy, bridge, fine, first, second, numerical,
+                     export_level=0):
+    if any(second.stats.get(key) for key in ("uncovered_free_rows", "empty_free_rows",
+                                            "injection_error", "repair_budget_exhausted")):
+        return None, "second_interpolation_coverage_or_injection"
+    if int(second.owners[-1]) > config["terminal_max_dofs"]:
+        return None, "terminal_size_limit"
+    try:
+        space = Hierarchy(p, legacy, first, second, config["terminal_max_dofs"])
+    except ValueError as error:
+        if str(error) != "terminal_condition_limit":
+            raise
+        return None, "terminal_condition_limit"
+    numerical["condition"] = space.condition
+    numerical["galerkin_errors"] = space.parity(fine)
+    if export_level:
+        space.direction_samples = []
+    if config.get("student_cycle"):
+        bridge.gnn_local_nnz.argtypes = [p.P, C.POINTER(p.D)]
+        bridge.gnn_local_nnz.restype = p.I
+        nnz = p.D()
+        code = bridge.gnn_local_nnz(first.coarse, C.byref(nnz))
+        if code:
+            raise RuntimeError("Cannot query K1 nonzeros: %d" % code)
+        numerical["k1_nnz"] = int(p.reduce([nnz.value])[0])
+    return space, "galerkin_identity" if max(numerical["galerkin_errors"]) > 1e-9 else None
+
+
+def prepare_factorized(config, p, legacy, bridge, k, layout, fields, fine, local, model,
+                       train_weights=False, policy=None):
+    from .factorized import InvalidFactorization, first_graph, interval, next_graph
+
+    first = second = space = None
+    proposed_first, proposed_second = None, None
+    numerical, timings, failure = {}, {}, None
+    level_key = "level1"
+    start = time.perf_counter()
+    try:
+        graph, attributes, coordinates = first_graph(p, bridge, k, layout, fields)
+        timings["fine_graph_s"] = p.maximum(time.perf_counter()-start)
+        first = interval(config, p, legacy, bridge, k, graph, model, 0, coordinates, train_weights, policy)
+        numerical["level1"] = first.stats
+        proposed_first = first.executed_markers == 1
+        level_key = "level2"
+        start = time.perf_counter()
+        graph = next_graph(p, bridge, first, attributes, coordinates)
+        timings["actual_k1_graph_s"] = p.maximum(time.perf_counter()-start)
+        second = interval(config, p, legacy, bridge, first.coarse, graph, model, 3, coordinates,
+                          train_weights, policy)
+        numerical["level2"] = second.stats
+        proposed_second = second.executed_markers == 1
+        space, failure = finish_hierarchy(config, p, legacy, bridge, fine, first, second, numerical)
+    except InvalidFactorization as error:
+        failure = str(error)
+        numerical[level_key] = error.stats
+    return DisplacementPC(p, fine, local, first, second, space, None, None,
+                          proposed_first, proposed_second, numerical, timings, failure)
+
+
 def prepare_displacement(config, p, legacy, bridge, rpc, k, layout, fields, cache,
                          neutral=False, context=None):
     fine = Action(p, k)
@@ -120,6 +182,10 @@ def prepare_displacement(config, p, legacy, bridge, rpc, k, layout, fields, cach
     comp = layout["component"][lo:hi].astype(np.int32)
     fixed = fields["constrained"][native]
     local = legacy.LocalPC(p, k, cache, lo, hi, "ras")
+    if (context or {}).get("factor_model") is not None:
+        return prepare_factorized(config, p, legacy, bridge, k, layout, fields, fine, local,
+                                  context["factor_model"], context.get("factor_feedback") is not None,
+                                  context.get("factor_policy"))
     fast = (context or {}).get("fast_prior", False)
     if fast and (neutral or context.get("policy") != "prior_only" or context.get("training")
                  or config["decoder"]["kind"] != "directed_graph"):
@@ -220,32 +286,9 @@ def prepare_displacement(config, p, legacy, bridge, rpc, k, layout, fields, cach
             raise ValueError("Unknown P2 builder: " + builder)
         if second is None:
             assert failure is not None
-        elif second.stats["uncovered_free_rows"] or second.stats["empty_free_rows"] or second.stats["injection_error"] or second.stats["repair_budget_exhausted"]:
-            failure = "second_interpolation_coverage_or_injection"
-        elif int(second.owners[-1]) > config["terminal_max_dofs"]:
-            failure = "terminal_size_limit"
         else:
-            try:
-                space = Hierarchy(p, legacy, first, second, config["terminal_max_dofs"])
-            except ValueError as error:
-                if str(error) != "terminal_condition_limit":
-                    raise
-                failure = "terminal_condition_limit"
-            if space is not None:
-                numerical["condition"] = space.condition
-                numerical["galerkin_errors"] = space.parity(fine)
-                if export_level:
-                    space.direction_samples = []
-                if config.get("student_cycle"):
-                    bridge.gnn_local_nnz.argtypes = [p.P, C.POINTER(p.D)]
-                    bridge.gnn_local_nnz.restype = p.I
-                    nnz = p.D()
-                    code = bridge.gnn_local_nnz(first.coarse, C.byref(nnz))
-                    if code:
-                        raise RuntimeError("Cannot query K1 nonzeros: %d" % code)
-                    numerical["k1_nnz"] = int(p.reduce([nnz.value])[0])
-                if max(numerical["galerkin_errors"]) > 1e-9:
-                    failure = "galerkin_identity"
+            space, failure = finish_hierarchy(config, p, legacy, bridge, fine, first, second,
+                                              numerical, export_level)
     return DisplacementPC(p, fine, local, first, second, space, first_seed, second_seed,
                           proposed_first, proposed_second, numerical, timings, failure)
 
@@ -269,6 +312,30 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     cache = Path(config["baseline_directory"]) / "cache" / row["case"]
     displacement = prepare_displacement(config, p, legacy, bridge, rpc, k, layout, fields,
                                         cache, neutral, context)
+    context = context or {}
+    probe_windows = context.get("factor_probe_windows")
+    probe_inputs = context.get("factor_probe_inputs")
+    probe_capture = context.get("factor_probe_capture")
+    signatures = context.get("factor_signatures")
+    signature = None
+    duplicate = False
+    if signatures is not None and displacement.failure is None:
+        from .factorized import hierarchy_signature
+
+        signature = hierarchy_signature(displacement.numerical)
+        duplicate = signature in signatures
+        signatures.add(signature)
+    if duplicate or context.get("factor_policy_replay"):
+        try:
+            if duplicate:
+                return dict(duplicate=True, hierarchy_signature=signature,
+                            numerical=displacement.numerical)
+            return dict(factor_policy=context["factor_policy"].receipt(),
+                        failure=displacement.failure, numerical=displacement.numerical)
+        finally:
+            p.destroy("KSP", outer)
+            displacement.close()
+            p.destroy("Vec", solution)
     first, second, space = displacement.first, displacement.second, displacement.space
     first_seed, second_seed = displacement.first_seed, displacement.second_seed
     proposed_first, proposed_second = displacement.proposed_first, displacement.proposed_second
@@ -280,18 +347,50 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     models = (context or {}).get("students", {})
     shell = callback = None
     apply_times = []
+    observed = (context or {}).get("capture_inputs")
+    short_lengths = (context or {}).get("short_krylov")
+    factor_feedback = (context or {}).get("factor_feedback")
+    capture_probes = probe_capture is not None or (factor_feedback is not None and probe_inputs is None)
+    residual_samples = {} if short_lengths or capture_probes else None
     if failure is None:
-        shell, callback = replay.pcapply_shell(p, child, operator, k, displacement.apply, apply_times)
+        action = displacement.apply
+        if observed is not None:
+            def action(source, target):
+                call = len(apply_times)
+                if call in (0, 8, 24, 48) or call % 32 == 0:
+                    residual = p.array(source)
+                    if call >= 64 and observed and observed[-1][0] >= 64:
+                        observed[-1] = call, residual
+                    else:
+                        observed.append((call, residual))
+                displacement.apply(source, target)
+        shell, callback = replay.pcapply_shell(p, child, operator, k, action, apply_times)
         replay.setup_solver(p, outer, fs, options)
         setup_s = p.maximum(time.perf_counter()-begin)
         apply_times.clear()
+        if observed is not None:
+            observed.clear()
         if export_level:
             space.direction_samples.clear()
             space.direction_calls = 0
-        if config["stage"] == "rl" or config.get("student_cycle") == "tune":
+        if context.get("factor_probe_only"):
+            from .krylov import probe_trajectories
+
+            started = time.perf_counter()
+            try:
+                return dict(trajectories=probe_trajectories(p, full, fs, probe_inputs, probe_windows),
+                            probe_s=p.maximum(time.perf_counter()-started), failure=None)
+            finally:
+                p.destroy("KSP", outer)
+                p.destroy("PC", shell)
+                displacement.close()
+                p.destroy("Vec", solution)
+        if residual_samples is not None or context.get("factor_policy") is not None or \
+                config["stage"] == "rl" or config.get("student_cycle") in (
+                "tune", "factor_tune", "factor_search"):
             result = solve_with_deadline(p, replay, outer, full, rhs, solution,
                 config["max_iterations"], max(config["atol"], config["rtol"]*rhs_norm),
-                begin+config["training"]["episode_timeout_seconds"])
+                begin+config["training"]["episode_timeout_seconds"], residual_samples)
         else:
             result = legacy.solve_with_true_residual(p, replay, outer, full, rhs, solution,
                 config["max_iterations"], max(config["atol"], config["rtol"]*rhs_norm), True)
@@ -300,18 +399,81 @@ def solve_policy(config, p, replay, legacy, bridge, rpc, row, layout, fields, da
     else:
         setup_s = p.maximum(time.perf_counter()-begin)
         result = dict(reached_true_target=False, total_wall_s=setup_s)
+    full_apply_count, full_apply_seconds = len(apply_times), sum(apply_times)
+    if context.get("factor_probe_only"):
+        p.destroy("KSP", outer)
+        displacement.close()
+        p.destroy("Vec", solution)
+        return dict(trajectories={}, failure=failure, probe_s=0.)
+    probes_short = probe_inputs
+    if space is not None and residual_samples:
+        from .krylov import verify_middle_ilu, verify_short_segments
+
+        actual = {iteration:values for iteration, values in residual_samples.values()}
+        probes_short = [("iteration-%d" % i, actual[i]) for i in sorted(actual)]
+        # Component-local directions supplement the actual early and late
+        # residuals. They have the full system layout and fixed physical IDs.
+        parent_start = ownership(p, full)[p.rank]
+        for component in range(3):
+            direction = np.zeros_like(next(iter(actual.values())))
+            chosen = (comp == component) & (fields["phi"][native//3] < .95)
+            direction[rows[chosen]-parent_start] = np.sin(.037*(native[chosen]+1))
+            probes_short.append(("displacement-%d" % component, direction))
+        if short_lengths:
+            result["short_krylov"] = verify_short_segments(p, full, fs, probes_short, short_lengths)
+            result["middle_ilu_adjoint_parity"] = verify_middle_ilu(p, bridge, first, space.middle)
+        if probe_capture is not None or (factor_feedback or {}).get("quality_targets") is not None:
+            late = residual_samples.get("late")
+            probes_short = [pair for pair in probes_short if pair[0] == "iteration-24"
+                            or pair[0].startswith("displacement-")]
+            if late is not None and late[0] > 24:
+                probes_short.append(("late", late[1]))
+            if probe_capture is not None:
+                probe_capture.extend(probes_short)
+    if probes_short and failure is None and (factor_feedback is not None or probe_windows):
+        from .krylov import coefficient_feedback, probe_trajectories
+
+        started = time.perf_counter()
+        if factor_feedback is not None:
+            result["coefficient_feedback"] = coefficient_feedback(
+                p, legacy, bridge, full, fs, shell, callback, displacement, context["factor_model"],
+                probes_short, factor_feedback)
+        if probe_windows:
+            result["factor_trajectories"] = probe_trajectories(p, full, fs, probes_short, probe_windows)
+        result["factor_probe_s"] = p.maximum(time.perf_counter()-started)
+    if signature is not None:
+        result["hierarchy_signature"] = signature
+    probes = (context or {}).get("probe_inputs")
+    if probes and space is not None and failure != "galerkin_identity":
+        ratios = []
+        for call, residual in probes:
+            difference = residual - displacement.fine(displacement.correction(residual))
+            error, norm = p.reduce([difference @ difference, residual @ residual])
+            if norm > 0 and np.isfinite(error):
+                ratios.append(dict(call=call, residual_ratio=float(np.sqrt(error/norm))))
+        result["student_cycle_probes"] = ratios
     decoder_name = "graph" if config.get("decoder", {}).get("kind") == "directed_graph" else "spatial"
-    result.update(method=("neutral_" if neutral else "gnn_")+decoder_name, failure=failure,
+    factorized = (context or {}).get("factor_model") is not None
+    method = "gnn_factorized" if factorized else ("neutral_" if neutral else "gnn_")+decoder_name
+    result.update(method=method, failure=failure,
         setup_wall_s=setup_s, numerical=numerical, timings=timings,
-        displacement_pc_apply_s=p.maximum(sum(apply_times)), displacement_pc_apply_count=len(apply_times),
-        gnn_inference=bool(models) or (not neutral and (context or {}).get("policy") != "prior_only"),
+        displacement_pc_apply_s=p.maximum(full_apply_seconds), displacement_pc_apply_count=full_apply_count,
+        gnn_inference=factorized or bool(models) or (not neutral and (context or {}).get("policy") != "prior_only"),
         interpolation_students={name:model["sha256"] for name,model in models.items()},
-        checkpoint_sha256=(timings["first_decision"].get("policy_reply") or {}).get("checkpoint_sha256"),
+        checkpoint_sha256=(timings.get("first_decision", {}).get("policy_reply") or {}).get("checkpoint_sha256"),
         teacher_hierarchy_read=False,
         policy_update=(context or {}).get("update", 0),
         checkpoint_scope="Initial checkpoint; policy_update identifies subsequent on-policy updates"
             if (context or {}).get("training") else "Frozen inference checkpoint",
-        timing_scope="Fresh physical/algebraic features,2decisionpolicy/RPC path,repair,preconditioner construction and complete true-residual-monitored solve. Algebra audits included. Replay input loading and artifact logging excluded for all methods.")
+        timing_scope=("Fresh graph, all five selections and transfers, products, Galerkin, "
+                      "RAS, audits, and full true-residual solve. Loaded weights and replay "
+                      "input are outside timing." if factorized else
+                      "Fresh features, policy decisions, repair, preconditioner construction "
+                      "and complete true-residual solve. Algebra audits included. Replay input "
+                      "loading and artifact logging excluded."))
+    policy = (context or {}).get("factor_policy")
+    if policy is not None:
+        result["factor_policy"] = policy.receipt()
     if capture is not None and result["reached_true_target"]:
         for name, matrix in (("P1", first.transfer), ("K1", first.coarse), ("P2", second.transfer)):
             values, _ = local_csr(p, matrix, bridge)
