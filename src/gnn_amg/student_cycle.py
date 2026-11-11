@@ -550,6 +550,8 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
         models = method.get("students", {})
         direct = label == "direct_p1" or method.get("direct", False)
         if "factor_model" in method:
+            if method["factor_model"].matrix_only:
+                fields = dict(constrained=fields["constrained"])
             context = dict(factor_model=method["factor_model"], archive_choices=False, tag=tag,
                            probe_inputs=method.get("probe_inputs"), short_krylov=method.get("short_krylov"),
                            factor_feedback=method.get("factor_feedback"))
@@ -784,6 +786,14 @@ def run_cycle(config, p, replay, legacy, bridge, inventory):
         report.update(source=settings["source_report"], model=config["factor_model"], keys=keys, cases=cases,
                       totals=method_totals(cases), comparisons=comparisons,
                       cached_teacher=dict(keys=cached_keys, cases=cached, totals=method_totals(cached)))
+    elif mode == "factor_input":
+        from .factor_replay import run_matrix_input
+
+        report.update(run_matrix_input(config,p,legacy,bridge,frames,load,destroy,solve,share,evaluate,job))
+    elif mode == "factor_attention_point":
+        from .factor_replay import run_attention_point
+
+        report.update(run_attention_point(config,p,legacy,replay,bridge,frames,load,destroy,solve,share,job))
     elif mode == "factor_attention":
         from .factor_replay import run_attention_replay
 

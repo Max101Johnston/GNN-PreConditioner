@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 
 from .backend import digest, record
-from .factor_operator import archive_probes, checked_json, make_probes, operator_observation, split_model
-from .factorized import FactorModel, load_model, save_model
+from .factor_operator import action_losses, archive_probes, checked_json, make_probes, operator_observation, split_model
+from .factorized import DEPTHS, PHYSICAL_COLUMNS, STAGES, FactorModel, hierarchy_signature, load_model, save_model
 from .student_cycle import method_totals, save_once
 
 
@@ -752,6 +752,272 @@ def run_cost_replay(config, p, legacy, bridge, frames, load, destroy, solve, sha
                 benchmark=benchmark, speed_gate=bool(benchmark and benchmark["student"]["eligible"]))
 
 
+def fit_matrix_encoder(teacher, moments, regularization):
+    """Fit the omitted contribution to the teacher's first-layer activation."""
+    width, inputs = teacher.layers[0][0].shape
+    observed = np.setdiff1d(np.arange(inputs+1), PHYSICAL_COLUMNS)
+    if moments.shape != (STAGES, inputs+1, inputs+1) or not regularization > 0:
+        raise ValueError("Invalid matrix-input fitting statistics")
+
+    def transfer(leaf, gram):
+        original, _ = leaf.layers[0]
+        lhs = gram[np.ix_(observed, observed)]
+        rhs = gram[np.ix_(observed, PHYSICAL_COLUMNS)] @ original[:, PHYSICAL_COLUMNS].T
+        lhs += np.diag(regularization * np.maximum(lhs.diagonal(), 1e-10))
+        correction = np.linalg.solve(lhs, rhs).T
+        weights = leaf.weights.copy()
+        first = weights[:original.size].reshape(original.shape)
+        first[:, PHYSICAL_COLUMNS] = 0.
+        first[:, observed[:-1]] += correction[:, :-1]
+        weights[original.size:original.size+width] += correction[:, -1]
+        return weights
+
+    pivot = DEPTHS[0]
+    coeff = np.stack([transfer(teacher.coefficients_at(stage), gram)
+                      for stage, gram in ((0,moments[:pivot].sum(0)), (pivot,moments[pivot:].sum(0)))])
+    return replace(teacher, weights=transfer(teacher, moments.sum(0)),
+                   coefficient_weights=coeff, matrix_only=True)
+
+
+def run_matrix_input(config, p, legacy, bridge, frames, load, destroy, solve, share, evaluate, job):
+    """Distill a deployable encoder, then use the real cycles and complete solves."""
+    settings = config["factor_input"]
+    source = checked_json(settings["source_report"])
+    archive = checked_json(settings["probe_report"])
+    baseline = load_model(config["factor_model"])
+    groups = settings["batches"]
+    workers = config["parallel_workers"]
+    fit = [key for group in groups for key in group]
+    diagnostics, validation = settings["diagnostic_keys"], config["training"]["validation_keys"]
+    all_keys = fit + diagnostics + validation
+    if (source["winner"]["model"] != config["factor_model"] or source["winner"]["inference"] is not None
+            or source["source"] != settings["probe_report"] or source["validation_keys"] != validation
+            or baseline.matrix_only or baseline.context_size or baseline.coefficient_weights is None
+            or baseline.product_compression is not None or len(set(all_keys)) != len(all_keys)
+            or any(not group or len(group)>workers for group in groups)
+            or any(frames[key]["split"]!="training" for key in fit+diagnostics)
+            or any(frames[key]["split"]!="validation" for key in validation)):
+        raise ValueError("Matrix-only fitting requires the frozen teacher and disjoint fixed splits")
+
+    bank = {key:list(archive["probe_bank"][key]) for key in fit}
+    for capture in source["captures"]:
+        if capture["key"] in bank and capture["receipt"] is not None:
+            bank[capture["key"]].append(capture["receipt"])
+
+    def method(name, model, **context):
+        return dict(name=name, factor_model=model, factor_context=dict(factor_fusion=True, **context))
+
+    def checkpoint(model, name):
+        path = Path(config["output_directory"])/"checkpoints"/("generator-%s-%s.npz" % (job, name))
+        receipt, = share([save_model(path,model)] if p.global_rank==0 else [])
+        return receipt
+
+    dimension = baseline.layers[0][0].shape[1]+1
+    moments = np.zeros((STAGES,dimension,dimension))
+    fitting = []
+    for index,key in enumerate(fit):
+        if index%workers != p.worker:
+            continue
+        state = load(key)
+        try:
+            probes = load_probe_shards(p,bank[key])
+
+            def observe(displacement):
+                rows = []
+                for level in (displacement.first, displacement.second):
+                    for factor in level.fixed_factors:
+                        x = np.column_stack((factor.x,np.ones(len(factor.x))))
+                        count = int(factor.rows[-1])
+                        moments[factor.stage] += p.reduce(x.T@x)/count
+                        rows.append(count)
+                losses,_ = action_losses(p,displacement,probes)
+                return dict(failure=None,rows=rows,probes=losses,
+                            signature=hierarchy_signature(displacement.numerical))
+
+            result = solve(key,state,method("input_teacher",baseline,factor_tape=True,
+                                             factor_operation=observe),"input-distill",details=False)
+            if result["failure"] is not None or len(result["rows"])!=STAGES:
+                raise ValueError("The frozen factor trajectory failed on "+key)
+            if p.rank==0:
+                fitting.append(dict(key=key,**result))
+        finally:
+            destroy(state)
+    pieces = share([dict(rows=fitting,moments=moments.tolist())] if p.rank==0 else [])
+    fitting = [row for piece in pieces for row in piece["rows"]]
+    if sorted(row["key"] for row in fitting)!=sorted(fit):
+        raise ValueError("Incomplete matrix-input distillation sample")
+    initial = fit_matrix_encoder(baseline,np.sum([r["moments"] for r in pieces],axis=0)/len(fit),
+                                 settings["regularization"])
+    models = {"matrix_distilled":initial}
+    receipts = {"matrix_distilled":checkpoint(initial,"matrix-distilled")}
+    if p.global_rank==0:
+        record(config,"factor_input_distilled",job=job,model=receipts["matrix_distilled"],
+               fit_keys=fit, rows=np.sum([row["rows"] for row in fitting],axis=0).tolist())
+
+    teacher_losses = {row["key"]:row["probes"] for row in fitting}
+    update = settings["update"]
+    model,step,history = initial,update["step_size"],[]
+    for epoch in range(1,settings["rounds"]+1):
+        for group in groups:
+            states = {key:load(key) for i,key in enumerate(group) if i%workers==p.worker}
+            try:
+                probes = {key:load_probe_shards(p,bank[key]) for key in states}
+                model,result,step = training_update(p,legacy,bridge,model,states,probes,teacher_losses,
+                    solve,share,settings["numerical"],update,True,step)
+            finally:
+                for state in states.values():
+                    destroy(state)
+            history.append(dict(round=epoch,keys=group,update=result))
+            if p.global_rank==0:
+                record(config,"factor_input_batch",job=job,round=epoch,keys=group,accepted=result["accepted"])
+    if any(row["update"]["accepted"] for row in history):
+        models["matrix_tuned"] = model
+        receipts["matrix_tuned"] = checkpoint(model,"matrix-tuned")
+
+    frozen = method("frozen",baseline)
+    student = dict(config["factor_reference"],fallback=False)
+    margin = -settings["student_slack"]
+    diagnostic_cases = evaluate(diagnostics,[frozen,student,*(method(name,m) for name,m in models.items())],
+                                "input-diagnostics",repeats=2)
+    pairs = {name:cost_pair(diagnostic_cases,diagnostics,"student",name,margin) for name in models}
+    eligible = [name for name,pair in pairs.items() if pair["eligible"]]
+    winner = min(eligible,key=lambda name:cost_rank(pairs[name])) if eligible else None
+    cases,comparison = [],{}
+    if winner is not None:
+        cases = evaluate(validation,[frozen,student,method(winner,models[winner])],"input-validation",repeats=2)
+        comparison = {name:cost_pair(cases,validation,name,winner,margin) for name in ("student","frozen")}
+    ready = bool(comparison and comparison["student"]["eligible"])
+    if p.global_rank==0:
+        record(config,"factor_input_result",job=job,selected=winner,live_eligible=ready,
+               diagnostic_ratios={name:pair["ratios"] for name,pair in pairs.items()},
+               validation_ratios={name:pair["ratios"] for name,pair in comparison.items()})
+    return dict(baseline=config["factor_model"],source=settings["source_report"],probes=settings["probe_report"],
+                inputs=["displacement_matrix","coordinates","constraints"],fitting=fitting,history=history,
+                models=receipts,diagnostic_keys=diagnostics,diagnostic_cases=diagnostic_cases,
+                diagnostics=pairs,validation_keys=validation,cases=cases,comparison=comparison,
+                winner=receipts.get(winner),winner_name=winner,live_eligible=ready)
+
+
+def run_attention_point(config, p, legacy, replay, bridge, frames, load, destroy, solve, share, job):
+    from .factor_operator import diagnose_attention_point
+    from .live import verify_archived_fields
+
+    point = config["factor_attention_point"]
+    settings = config["factor_attention"]
+    audit = checked_json(point["failed_report"])
+    source = checked_json(settings["source_report"])
+    archive = checked_json(settings["probe_report"])
+    key = point["key"]
+    expected, = [r for r in audit["audit"]["attention"]["rows"] if r["key"] == key]
+    if (audit["job"] != point["job"] or audit["audit_passed"] or audit["history"]
+            or expected["directional_derivatives"]["levels"][1]["stable_window"] is not None
+            or key not in settings["batches"][0] or frames[key]["split"] != "training"
+            or audit["baseline"] != config["factor_model"] or source["winner"]["model"] != audit["baseline"]
+            or settings["source_report"] != audit["source"] or settings["probe_report"] != audit["probes"]
+            or p.size*audit["workers"] != audit["cpu_ranks"]):
+        raise ValueError("The attention diagnostic does not match the failed audit and MPI layout")
+    baseline = load_model(config["factor_model"])
+    added = np.zeros((len(baseline.coefficient_weights), 2*baseline.width), dtype=baseline.weights.dtype)
+    model = replace(baseline, context_kind="attention",
+                    coefficient_weights=np.column_stack((baseline.coefficient_weights, added)))
+    bank = list(archive["probe_bank"][key])
+    bank.extend(c["receipt"] for c in source["captures"] if c["key"] == key and c["receipt"] is not None)
+    probes = load_probe_shards(p, bank)
+    if [probe[0] for probe in probes] != audit["probe_names"][key]:
+        raise ValueError("The original probe set changed")
+    state = load(key)
+    try:
+        layout, fields, _ = state
+        field_parity = verify_archived_fields(p, config, legacy, replay, frames[key], layout, fields)
+        if p.global_rank == 0:
+            record(config, "live_field_snapshot_parity", job=job, **field_parity)
+
+        def operation(displacement):
+            return diagnose_attention_point(p,legacy,bridge,displacement,model,probes,expected,
+                                             dict(settings["numerical"], steps=point["steps"]))
+
+        result = solve(key,state,dict(name="attention_point",factor_model=model,
+            factor_context=dict(factor_tape=True,factor_operation=operation,factor_fusion=True)),
+            "attention-point",details=False)
+    finally:
+        destroy(state)
+    result, = share([result] if p.rank == 0 else [])
+    return dict(key=key, failed_report=point["failed_report"], baseline=config["factor_model"],
+                field_parity=field_parity, diagnostic=result)
+
+
+def resolve_attention_audit(config, p, probe_names):
+    """Reuse the frozen audit with one branch-local derivative resolution."""
+    settings = config["factor_attention"]
+    numerical = settings["numerical"]
+    receipts = settings["audit_resume"]
+    original = checked_json(receipts["original"])
+    point = checked_json(receipts["point"])
+    diagnostic = point["diagnostic"]
+    if (original["audit_passed"] or original["history"] or original["models"]
+            or original["cpu_ranks"] != p.global_size or original["workers"] != config["parallel_workers"]
+            or original["baseline"] != config["factor_model"] or point["baseline"] != original["baseline"]
+            or original["source"] != settings["source_report"] or original["probes"] != settings["probe_report"]
+            or original["probe_names"] != probe_names or point["failed_report"] != receipts["original"]
+            or point["mode"] != "factor_attention_point" or diagnostic["level"] != 2):
+        raise ValueError("Attention audit receipts do not match the unchanged training setup")
+    tolerance = numerical["finite_tolerance"]
+    unresolved = []
+    audit = original["audit"]
+    for name, result in audit.items():
+        if (not result["exact_initialization"]
+                or {row["key"] for row in result["rows"]} != set(settings["batches"][0])):
+            raise ValueError("Cannot reuse the initialization and scope of this audit")
+        for row in result["rows"]:
+            derivatives = row["directional_derivatives"]
+            if (row["failure"] or derivatives["center_relative_error"] >= numerical["center_tolerance"]
+                    or max(row["dot_errors"]) >= numerical["adjoint_tolerance"]):
+                raise ValueError("An archived operator audit failed outside the branch diagnostic")
+            for level in derivatives["levels"]:
+                if level["stable_window"] is None or level["relative_error"] >= tolerance:
+                    unresolved.append((name, row, level))
+    if len(unresolved) != 1:
+        raise ValueError("Expected one unresolved attention audit")
+    name, row, level = unresolved[0]
+    if (name != "attention" or row["key"] != point["key"] or level["level"] != diagnostic["level"]
+            or level != diagnostic["original_level"] or row["signature"] != diagnostic["signature"]
+            or list(row["probes"]) != diagnostic["probes"]):
+        raise ValueError("The point diagnostic belongs to a different audit")
+
+    analytic = diagnostic["analytic"]
+    factors = diagnostic["local_factors"]
+    fp64 = sum(f["coefficients_ad"] for f in factors)
+    if abs(fp64-analytic) >= tolerance*abs(analytic):
+        raise ValueError("The FP64 and production analytic gradients disagree")
+    accepted = []
+    for index, full in enumerate(diagnostic["full_operator_fp32"]):
+        local = [f["measurements"][index] for f in factors]
+        crossings = [m["production_crossings"] for m in local]
+        if (full["relative_errors"]["plus"] >= tolerance
+                or any(pair[1]["relu"] for pair in crossings)
+                or any(side["clip"] for pair in crossings for side in pair)
+                or not any(pair[0]["relu"] for pair in crossings)):
+            continue
+        local_errors = [max(m["pooling_fp64"]["relative_errors"]["central"],
+                            m["signed_coefficients_fp64"]["relative_errors"]["plus"]) for m in local]
+        minus = sum(m["signed_coefficients_fp64"]["slopes"]["minus"] for m in local)
+        minus_gap = abs(minus-full["slopes"]["minus"])/abs(analytic)
+        if max(local_errors+[minus_gap]) < tolerance:
+            accepted.append((index, full, minus_gap))
+    for low, high in zip(accepted, accepted[1:]):
+        if high[0] != low[0]+1:
+            continue
+        a,b = low[1]["slopes"]["plus"],high[1]["slopes"]["plus"]
+        agreement = abs(a-b)/max(abs(a),abs(b),abs(analytic))
+        if agreement < tolerance/2:
+            return audit, dict(key=row["key"], level=diagnostic["level"], side="plus",
+                original=receipts["original"], point=receipts["point"], tolerance=tolerance,
+                steps=[low[1]["step"],high[1]["step"]], relative_difference=agreement,
+                relative_errors=[low[1]["relative_errors"]["plus"],high[1]["relative_errors"]["plus"]],
+                minus_explanation=[low[2],high[2]])
+    raise ValueError("No adjacent same-branch slopes resolved the failed attention audit")
+
+
 def run_attention_replay(config, p, legacy, bridge, frames, load, destroy, solve, share, evaluate, job):
     """Test one candidate-local attention model against a matched capacity control."""
     settings = config["factor_attention"]
@@ -793,30 +1059,36 @@ def run_attention_replay(config, p, legacy, bridge, frames, load, destroy, solve
     def local_batch(keys):
         return {k:load(k) for i,k in enumerate(keys) if i%workers==p.worker}
 
-    states = local_batch(groups[0])
-    try:
-        probes = {k:load_probe_shards(p, bank[k]) for k in states}
-        reference = measure(baseline, states, probes)
-        audit = {}
-        for name in names:
-            rows = measure(models[name], states, probes, audit=True)
-            exact = len(reference)==len(groups[0]) and equivalent_probe_actions(reference, rows)
-            passed = bool(exact and all(r["directional_derivatives"]["passed"] for r in rows))
-            audit[name] = dict(exact_initialization=exact, passed=passed,
-                               rows=[{k:v for k,v in r.items() if k!="gradient"} for r in rows])
-    finally:
-        for state in states.values():
-            destroy(state)
-    verified = all(a["passed"] for a in audit.values())
+    probe_names = {k:[r["phase"]+"/"+n for r in bank[k] for n in r["probes"]] for k in fit}
+    resolution = None
+    if "audit_resume" in settings:
+        audit,resolution = resolve_attention_audit(config,p,probe_names)
+        verified = True
+    else:
+        states = local_batch(groups[0])
+        try:
+            probes = {k:load_probe_shards(p, bank[k]) for k in states}
+            reference = measure(baseline, states, probes)
+            audit = {}
+            for name in names:
+                rows = measure(models[name], states, probes, audit=True)
+                exact = len(reference)==len(groups[0]) and equivalent_probe_actions(reference, rows)
+                passed = bool(exact and all(r["directional_derivatives"]["passed"] for r in rows))
+                audit[name] = dict(exact_initialization=exact, passed=passed,
+                                   rows=[{k:v for k,v in r.items() if k!="gradient"} for r in rows])
+        finally:
+            for state in states.values():
+                destroy(state)
+        verified = all(a["passed"] for a in audit.values())
     result = dict(source=settings["source_report"], probes=settings["probe_report"],
         baseline=config["factor_model"], fit_keys=fit, diagnostic_keys=diagnostics, validation_keys=validation,
-        probe_names={k:[r["phase"]+"/"+n for r in bank[k] for n in r["probes"]] for k in fit},
-        new_parameters_per_model=int(added.size), audit=audit, audit_passed=verified,
+        probe_names=probe_names, new_parameters_per_model=int(added.size),
+        audit=audit, audit_resolution=resolution, audit_passed=verified,
         history=[], models={}, diagnostic_cases=[], diagnostic_comparison={}, cases=[],
         validation_comparison={}, speed_gate=False, research_gate=False)
     if p.global_rank==0:
         record(config, "factor_attention_audit", job=job, keys=groups[0],
-               passed={name:r["passed"] for name,r in audit.items()})
+               passed={name:r["passed"] for name,r in audit.items()}, resolution=resolution)
     if not verified:
         return result
 

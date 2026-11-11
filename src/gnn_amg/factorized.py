@@ -12,11 +12,14 @@ from scipy import sparse
 from .backend import Action, bind, digest, local_csr, neighbour_blocks, ownership, pooled_attributes, read_json
 from .dataset import ATTRIBUTE_NAMES, physical_attributes
 from .interpolation import imported_transfer
-from .student import (CONTEXT_SCORE_SCALE, geometry_candidates, match_targets, pack, row_csr,
+from .student import (CONTEXT_SCORE_SCALE, geometry_candidates, geometry_tree, match_targets, pack, row_csr,
                       stiffness_features)
 
 DEPTHS = (3, 2)
 NODE_FEATURES = len(ATTRIBUTE_NAMES) + 5 + 3 + 2
+PHYSICAL_COLUMNS = np.concatenate([
+    block * NODE_FEATURES + np.arange(len(ATTRIBUTE_NAMES) - 3)
+    for block in range(3)])
 EDGE_FEATURES = 8
 STAGES = sum(DEPTHS)
 REGIONS = 8
@@ -129,10 +132,10 @@ def coefficients(logit, correction, keep, same, unit_row_sum=False):
 
 
 
-def candidate_context(kind, parameters, fine, hidden, valid):
+def candidate_context(kind, parameters, fine, hidden, valid, *, dtype=np.float32):
     """Pool an existing candidate row. Weights here never become interpolation."""
     count = np.maximum(valid.sum(1, keepdims=True), 1)
-    mean = ((hidden * valid[:, :, None]).sum(1) / count).astype(np.float32)
+    mean = ((hidden * valid[:, :, None]).sum(1) / count).astype(dtype)
     if parameters is None:
         return mean, None
     query = fine * parameters[0] + parameters[1]
@@ -178,6 +181,7 @@ class FactorModel:
     product_compression: np.ndarray = None
     context_kind: str = "mean"
     context_parameters: np.ndarray = None
+    matrix_only: bool = False
 
     def __post_init__(self):
         self.layers = []
@@ -193,6 +197,8 @@ class FactorModel:
             raise ValueError("Invalid row-sum constraint depth")
         if not np.isfinite(self.weights).all() or not np.isfinite(self.adapters).all():
             raise ValueError("Non-finite factorized model")
+        if self.matrix_only and np.any(self.layers[0][0][:, PHYSICAL_COLUMNS]):
+            raise ValueError("Matrix-only encoder has physical input weights")
 
         if self.product_compression is not None and (
                 self.product_compression.shape != (PRODUCT_SUPPORT_FEATURES + PRODUCT_BUDGET_FEATURES,)
@@ -209,7 +215,8 @@ class FactorModel:
                 self.width, weights[:self.weights.size], self.adapters, self.unit_sum_depth,
                 context_kind=self.context_kind,
                 context_parameters=weights[self.weights.size:].reshape(2,self.width)
-                    if self.context_size else None) for weights in self.coefficient_weights)
+                    if self.context_size else None,
+                matrix_only=self.matrix_only) for weights in self.coefficient_weights)
         elif self.context_size:
             if (self.context_parameters is None or self.context_parameters.shape != (2,self.width)
                     or not np.isfinite(self.context_parameters).all()):
@@ -238,13 +245,14 @@ class FactorModel:
         logits[:, 1] += adapter[:, 1]
         return hidden, logits
 
-    def edge_outputs(self, fine, coarse, edges, valid, stage, regions, tape=None, keep=None):
+    def edge_outputs(self, fine, coarse, edges, valid, stage, regions, tape=None, keep=None,
+                     *, context_dtype=np.float32):
         weight, bias = self.layers[2]
         w = self.width
         hidden = np.maximum(0, (fine @ weight[:, :w].T)[:, None, :] +
             coarse @ weight[:, w:2*w].T + edges @ weight[:, 2*w:].T + bias)
         summary, context_tape = candidate_context(
-            self.context_kind, self.context_parameters, fine, hidden, valid)
+            self.context_kind, self.context_parameters, fine, hidden, valid, dtype=context_dtype)
         weight, bias = self.layers[3]
         row_context = summary @ weight[:, w:].T
         if keep is not None:
@@ -283,6 +291,8 @@ def save_model(path, model):
         params["context_kind"] = model.context_kind
     if model.context_parameters is not None:
         params["context_parameters"] = model.context_parameters
+    if model.matrix_only:
+        params["matrix_only"] = True
     with Path(path).open("xb") as stream:
         np.savez(stream, **params)
     return dict(path=str(path), sha256=digest(path))
@@ -297,8 +307,9 @@ def load_model(receipt):
         compression = f["product_compression"] if "product_compression" in f.files else None
         kind = f["context_kind"].item() if "context_kind" in f.files else "mean"
         parameters = f["context_parameters"] if "context_parameters" in f.files else None
+        matrix_only = bool(f["matrix_only"]) if "matrix_only" in f.files else False
         return FactorModel(int(f["width"]), f["weights"], f["adapters"], depth, coeff, compression,
-                           kind, parameters)
+                           kind, parameters, matrix_only=matrix_only)
 
 
 @dataclass
@@ -413,17 +424,16 @@ def candidates(config, p, graph, selected, owners, coordinates, stage):
         missing = ~np.isin(np.arange(3), native[nearby] % 3)
         nearby = np.unique(np.r_[nearby, np.flatnonzero(missing[native % 3])]).astype(np.int32)
     count = config["factorized"]["geometry_candidates"]
+    tree_type = geometry_tree(embedded=config.get("stage")=="student_live")
     geo, spacing = geometry_candidates(graph.xyz, coordinates[native[nearby] // 3],
-        graph.native % 3, native[nearby] % 3, active, count)
+        graph.native % 3, native[nearby] % 3, active, count, tree_type=tree_type)
     geo = np.where(geo >= 0, nearby[np.maximum(geo, 0)], -1)
     absent = active & (geo[:, 0] < 0)
     if np.any(absent):
         # A component may be absent on a teacher-forced input. Keep these
         # rows visible in the coverage diagnostic using the same local pool.
-        from scipy.spatial import cKDTree
-
         nearby = nearby if len(nearby) else np.arange(len(native), dtype=np.int32)
-        distance, closest = cKDTree(coordinates[native[nearby] // 3]).query(graph.xyz[absent])
+        distance, closest = tree_type(coordinates[native[nearby] // 3]).query(graph.xyz[absent])
         geo[absent, 0] = nearby[closest]
         spacing[absent] = np.maximum(distance, 1e-6)
     assigned = geo[:, 0].copy()
@@ -434,9 +444,7 @@ def candidates(config, p, graph, selected, owners, coordinates, stage):
         assigned = geo[np.arange(len(geo)), first]
         missing = active & ~owned.any(1)
         if np.any(missing):
-            from scipy.spatial import cKDTree
-
-            _, closest = cKDTree(coordinates[native[start:stop] // 3]).query(graph.xyz[missing])
+            _, closest = tree_type(coordinates[native[start:stop] // 3]).query(graph.xyz[missing])
             assigned[missing] = start + closest
     assignment = np.where(selected, local_map, assigned)
     mapped = neighbour_blocks(p, graph.owners, assignment[:, None], neighbours).ravel()
@@ -549,7 +557,7 @@ class FixedFactor:
     keep: np.ndarray
     csr: object
 
-    def network(self, p, model, tape=None):
+    def network(self, p, model, tape=None, *, context_dtype=np.float32):
         cols, inverse = np.unique(self.columns[self.valid], return_inverse=True)
         x_coarse = neighbour_blocks(p, self.owners, self.x[self.selected], cols)
         x_fine = self.x[self.active]
@@ -558,11 +566,11 @@ class FixedFactor:
         coarse = np.zeros(self.columns.shape + (model.width,), fine.dtype)
         coarse[self.valid] = anchors[inverse]
         out, quota = model.edge_outputs(fine, coarse, self.edges, self.valid, self.stage,
-                                         self.regions, tape)
+                                         self.regions, tape, context_dtype=context_dtype)
         return out, fine, coarse, x_fine, x_coarse, anchors, inverse
 
-    def fixed_matrix(self, p, model):
-        out = self.network(p, model)[0]
+    def fixed_matrix(self, p, model, *, context_dtype=np.float32):
+        out = self.network(p, model, context_dtype=context_dtype)[0]
         weights = coefficients(out[:, :, 1], out[:, :, 2], self.keep, self.same,
                                self.stage < model.unit_sum_depth)
         rr, cc = np.nonzero(self.keep)
@@ -571,9 +579,10 @@ class FixedFactor:
         csr[local, cols] = weights[rr, cc]
         return csr
 
-    def backward(self, p, model, grad):
+    def backward(self, p, model, grad, *, context_dtype=np.float32, summary_cotangents=None):
         tape = []
-        out, fine, coarse, x, x_coarse, anchors, inverse = self.network(p, model, tape)
+        out, fine, coarse, x, x_coarse, anchors, inverse = self.network(
+            p, model, tape, context_dtype=context_dtype)
         rr, cc = np.nonzero(self.keep)
         grad_csr = sparse.csr_matrix((grad, self.csr.indices, self.csr.indptr), shape=self.csr.shape)
         values = np.zeros(self.keep.shape)
@@ -588,7 +597,8 @@ class FixedFactor:
         derivative = np.stack((np.zeros_like(logit), logit, signed), axis=2)
         d_context = []
         gradients, d_fine, d_coarse = edge_pullback(model, fine, coarse, self.edges,
-            self.valid, tape, derivative, context_gradients=d_context)
+            self.valid, tape, derivative, context_gradients=d_context,
+            summary_cotangents=summary_cotangents)
         d_fine *= fine > 0
         d_anchors = np.zeros(anchors.shape)
         np.add.at(d_anchors, inverse, d_coarse[self.valid])
@@ -603,7 +613,7 @@ def packed_gradient(gradients):
 
 
 def edge_pullback(model, fine, coarse, edges, valid, tape, derivative, quota_derivative=None,
-                  context_gradients=None):
+                  context_gradients=None, summary_cotangents=None):
     """Reverse the edge encoder and its masked row summary for either head."""
     hidden, summary, refined = tape[:3]
     gradients = [(np.zeros(w.shape), np.zeros(b.shape)) for w, b in model.layers]
@@ -622,6 +632,8 @@ def edge_pullback(model, fine, coarse, edges, valid, tape, derivative, quota_der
                         np.array([quota_derivative.sum()]))
         d_fine = quota_derivative[:, None] * model.layers[5][0][0, :width]
         d_summary += quota_derivative[:, None] * model.layers[5][0][0, width:]
+    if summary_cotangents is not None:
+        summary_cotangents.append(d_summary.copy())
     if len(tape) == 3:
         d_summary /= np.maximum(valid.sum(1, keepdims=True), 1)
         pooled = valid[:, :, None]*d_summary[:, None, :]
@@ -670,7 +682,7 @@ def projected_factor(p, upstream, raw, suffix, suffix_rows):
     return result
 
 
-def factor_cotangent(p, legacy, bridge, level, transfer_gradient, model):
+def factor_cotangent(p, legacy, bridge, level, transfer_gradient, model, *, observe=None):
     """Backpropagate through the products without building a dense factor gradient."""
     fixed = level.fixed_factors
     factors = []
@@ -687,6 +699,8 @@ def factor_cotangent(p, legacy, bridge, level, transfer_gradient, model):
         local = transfer_gradient if compression is None else compression.pullback(transfer_gradient)
         for j, (tape, suffix) in enumerate(zip(fixed, suffixes)):
             entries = projected_factor(p, local, tape.csr, suffix, tape.owners)
+            if observe is not None:
+                observe(tape, entries)
             gradient += tape.backward(p, model, entries)
             if j+1 < len(fixed):
                 if upstream is None:
@@ -1055,13 +1069,18 @@ def normalized_coordinates(xyz):
     return (xyz - (xyz.max(0) + xyz.min(0))/2) / np.maximum(np.ptp(xyz, axis=0), 1e-30)
 
 
-def first_graph(p, bridge, matrix, layout, fields):
+def first_graph(p, bridge, matrix, layout, fields, *, matrix_only=False):
     lo, hi = layout["ownership"][p.rank:p.rank+2]
     native = (3*layout["native_node"] + layout["component"])[lo:hi].astype(np.int64)
-    attributes = physical_attributes(fields, layout["xyz"], native)
+    coordinates = normalized_coordinates(layout["xyz"])
+    if matrix_only:
+        attributes = np.zeros((len(native), len(ATTRIBUTE_NAMES)))
+        attributes[:, -3:] = coordinates[native // 3]
+    else:
+        attributes = physical_attributes(fields, layout["xyz"], native)
     fixed = fields["constrained"][native]
     graph = matrix_graph(p, bridge, matrix, native, attributes, fixed, np.ones(len(native)))
-    return graph, attributes, normalized_coordinates(layout["xyz"])
+    return graph, attributes, coordinates
 
 
 def next_graph(p, bridge, level, attributes, coordinates):

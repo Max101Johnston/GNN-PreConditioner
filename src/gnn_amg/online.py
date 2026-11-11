@@ -150,7 +150,8 @@ def prepare_factorized(config, p, legacy, bridge, k, layout, fields, fine, local
     level_key = "level1"
     start = time.perf_counter()
     try:
-        graph, attributes, coordinates = first_graph(p, bridge, k, layout, fields)
+        graph, attributes, coordinates = first_graph(
+            p, bridge, k, layout, fields, matrix_only=model.matrix_only)
         timings["fine_graph_s"] = p.maximum(time.perf_counter()-start)
         first = interval(config, p, legacy, bridge, k, graph, model, 0, coordinates, train_weights, policy)
         numerical["level1"] = first.stats

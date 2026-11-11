@@ -9,7 +9,8 @@ import numpy as np
 from .backend import Hierarchy, digest, local_csr, neighbour_blocks, read_json, record
 from .dataset import ATTRIBUTE_NAMES
 from .factor_search import SearchProposal, probabilities
-from .factorized import (DEPTHS, MAX_SUPPORT, FactorModel, edge_pullback, factor_cotangent,
+from .factorized import (DEPTHS, MAX_SUPPORT, FactorModel, candidate_context, candidate_context_pullback,
+                         edge_pullback, factor_cotangent,
                          frozen_transfer, hierarchy_signature, load_model, normalized_coordinates,
                          packed_gradient, region_ids, save_model, support_mask, support_order)
 from .krylov import HierarchyAdjoint
@@ -390,6 +391,112 @@ def fixed_action_value(p, legacy, bridge, displacement, model, probes):
         for resource in (space,second,first):
             if resource is not None:
                 resource.close()
+
+
+def directional_slopes(center, minus, plus, step, analytic):
+    slopes = dict(minus=(center-minus)/step, plus=(plus-center)/step,
+                  central=(plus-minus)/(2*step))
+    errors = {name:abs(value-analytic)/max(abs(value),abs(analytic),1e-300)
+              for name,value in slopes.items()}
+    return dict(step=step, center=center, minus=minus, plus=plus,
+                slopes=slopes, relative_errors=errors)
+
+
+def attention_factor_point(p, factor, incoming, model, direction, steps):
+    """Audit the fixed local map with the actual Galerkin cotangent."""
+    dtype = np.float64
+    precise = replace(model, weights=model.weights.astype(dtype),
+                      adapters=model.adapters.astype(dtype),
+                      context_parameters=model.context_parameters.astype(dtype))
+    factor = replace(factor, csr=factor.csr.astype(dtype, copy=False))
+    d_summary, base_network, production_network = [], [], []
+    gradient = factor.backward(p,precise,incoming,context_dtype=dtype,summary_cotangents=d_summary)
+    fine = factor.network(p,precise,base_network,context_dtype=dtype)[1]
+    hidden, summary, _, context_tape = base_network
+    parameters = precise.context_parameters
+    _, _, d_pool = candidate_context_pullback(
+        "attention",parameters,fine,hidden,factor.valid,context_tape,d_summary[0])
+    analytic = p.reduce([np.sum(d_pool*direction),gradient[-model.context_size:]@direction.ravel()])
+    base = factor.fixed_matrix(p,precise,context_dtype=dtype)
+    logit = factor.network(p,model,production_network)[0][:,:,1]
+    primary = factor.keep & factor.same
+    if factor.stage < model.unit_sum_depth:
+        primary = np.where(primary.any(1,keepdims=True),primary,factor.keep)
+    at_center = production_network[2] > 0
+    peak = lambda array: p.maximum(np.max(np.abs(array),initial=0.))
+    measurements = []
+    for step in steps:
+        local, crossings = [], []
+        for sign in (-1,1):
+            shifted = parameters+sign*step*direction
+            pooled,_ = candidate_context("attention",shifted,fine,hidden,factor.valid,dtype=dtype)
+            trial = replace(precise, context_parameters=shifted)
+            csr = factor.fixed_matrix(p,trial,context_dtype=dtype)
+            local.append(p.reduce([np.sum(d_summary[0]*(pooled-summary)), incoming@(csr.data-base.data)]))
+
+            tape = []
+            trial32 = replace(model, context_parameters=shifted.astype(model.weights.dtype))
+            logits = factor.network(p,trial32,tape)[0][:,:,1]
+            relu = ((tape[2]>0)!=at_center) & factor.keep[:,:,None]
+            clip = (((logits<=-12)!=(logit<=-12)) | ((logits>=12)!=(logit>=12))) & primary
+            n_relu, n_clip = map(int,p.reduce([relu.sum(),clip.sum()]))
+            crossings.append(dict(sign=sign,relu=n_relu,clip=n_clip,
+                                  max_logit_change=peak((logits-logit)[factor.keep])))
+        measurements.append(dict(step=step, production_crossings=crossings, **{
+            name:directional_slopes(0.,float(local[0][i]),float(local[1][i]),step,float(analytic[i]))
+            for i,name in enumerate(("pooling_fp64","signed_coefficients_fp64"))}))
+    return dict(stage=factor.stage, pooling_ad=float(analytic[0]), coefficients_ad=float(analytic[1]),
+                measurements=measurements)
+
+
+def diagnose_attention_point(p, legacy, bridge, displacement, model, probes, expected, settings):
+    """Keep the original decoded tapes and revisit only the failed level."""
+    begin = time.perf_counter()
+    signature = hierarchy_signature(displacement.numerical)
+    if list(signature)!=expected["signature"]:
+        raise ValueError("The failed frame's fixed hierarchy did not reproduce")
+    original = expected["directional_derivatives"]
+    level_index = 1
+    leaf = model.coefficients_at(DEPTHS[0])
+    tapes = []
+    adjoint = HierarchyAdjoint(p,bridge,displacement)
+    try:
+        losses,dot = action_losses(p,displacement,probes,adjoint)
+        if list(losses)!=list(expected["probes"]) or not all(
+                np.isclose(loss,expected["probes"][name],rtol=2e-7,atol=1e-10)
+                for name,loss in losses.items()):
+            raise ValueError("The original probe actions did not reproduce")
+        if max(dot,default=0.)>settings["adjoint_tolerance"]:
+            raise ValueError("The failed frame's transpose parity did not reproduce")
+        transfer = adjoint.transfers(legacy)[level_index]
+        gradient = p.reduce(factor_cotangent(p,legacy,bridge,displacement.second,transfer,leaf,
+                                             observe=lambda tape, entries: tapes.append((tape,entries))))
+    finally:
+        adjoint.close()
+    vector = gradient[-leaf.context_size:]
+    norm = float(np.linalg.norm(vector))
+    center = fixed_action_value(p,legacy,bridge,displacement,model,probes)
+    if not (np.isclose(norm,original["levels"][level_index]["analytic"],rtol=2e-6,atol=1e-10)
+            and np.isclose(center,original["center"],rtol=2e-7,atol=1e-10)):
+        raise ValueError("The archived context direction or center did not reproduce")
+    direction = vector/norm
+    steps = settings["steps"]
+    factors = [attention_factor_point(p,tape,entries,leaf,direction.reshape(2,leaf.width),steps)
+               for tape,entries in tapes]
+    measurements = []
+    for step in steps:
+        values = []
+        for sign in (-1,1):
+            shifted = model.coefficient_weights.copy()
+            shifted[level_index,-leaf.context_size:] += sign*step*direction
+            trial = replace(model,coefficient_weights=shifted)
+            values.append(fixed_action_value(p,legacy,bridge,displacement,trial,probes))
+        measurements.append(directional_slopes(center,*values,step,norm))
+    return dict(signature=signature, probes=list(losses), loss=float(np.mean(list(losses.values()))),
+                level=level_index+1, analytic=norm, direction=direction.tolist(), dot_errors=dot,
+                local_factors=factors, full_operator_fp32=measurements,
+                original_center=original["center"], original_level=original["levels"][level_index],
+                seconds=p.maximum(time.perf_counter()-begin))
 
 
 def audit_operator_gradient(p, legacy, bridge, displacement, model, probes, value, gradients, settings):

@@ -184,9 +184,35 @@ def direct_inputs(config, p, legacy, bridge, matrix, pair, components):
     return candidate, seeds, p.maximum(time.perf_counter()-start)
 
 
-def geometry_candidates(fine_xyz, coarse_xyz, fine_comp, coarse_comp, free, count):
+@lru_cache(maxsize=2)
+def geometry_tree(embedded=False):
+    if not embedded:
+        from scipy.spatial import cKDTree
+
+        return cKDTree
+
+    # SciPy 1.8's spatial package also loads a pybind11 distance extension.
+    # It shares the OGS interpreter's registry key with a different layout.
+    import sys
+    from importlib.machinery import PathFinder
+    from importlib.util import module_from_spec
+    import scipy
+
+    name = "scipy.spatial._ckdtree"
+    module = sys.modules.get(name)
+    if module is None:
+        path = Path(scipy.__file__).parent/"spatial"
+        spec = PathFinder.find_spec(name,[str(path)])
+        if spec is None or spec.loader is None:
+            raise ImportError("The OGS image lacks the cKDTree extension")
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+    return module.cKDTree
+
+
+def geometry_candidates(fine_xyz, coarse_xyz, fine_comp, coarse_comp, free, count, *, tree_type=None):
     """Query only owned free rows and use component-local coarse lengths."""
-    from scipy.spatial import cKDTree
+    tree_type = geometry_tree() if tree_type is None else tree_type
 
     result = np.full((len(fine_xyz), count), -1, dtype=np.int32)
     spacing = np.ones(3)
@@ -196,7 +222,7 @@ def geometry_candidates(fine_xyz, coarse_xyz, fine_comp, coarse_comp, free, coun
         if not len(cols):
             continue
         points = coarse_xyz[cols]
-        tree = cKDTree(points)
+        tree = tree_type(points)
         if len(cols) > 1:
             nearest, _ = tree.query(points, k=[2])
             distances = nearest[nearest > 0]

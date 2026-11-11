@@ -27,6 +27,84 @@ class FactorizedTest(unittest.TestCase):
         for group in np.unique(labels[eligible]):
             self.assertTrue(capped[np.flatnonzero(labels == group)[-1]])
 
+    def test_archived_field_projection(self):
+        from gnn_amg.live import project_linearization
+
+        rng = np.random.default_rng(16)
+        owned = np.array([1, 3, 5])
+        cells = np.array([[0, 1, 2, 3, 4, 5, 6, 7],
+                          [1, 8, 9, 3, 10, 11, 12, 13]])
+        include = np.isin(cells, owned)
+        local = np.searchsorted(owned, cells[include])
+        incident = np.bincount(local, minlength=len(owned))
+        fracture = rng.uniform(.1, 4., (2, 8, 20))
+        projection = rng.normal(size=(8, 8))
+        features, aperture = project_linearization(fracture, include, local, incident, projection)
+        point_aperture = fracture[:, :, 8] @ projection
+        for i, node in enumerate(owned):
+            elements, corners = np.nonzero(cells == node)
+            np.testing.assert_allclose(features[i], fracture[elements].mean(1).mean(0))
+            np.testing.assert_allclose(aperture[i], point_aperture[elements, corners].mean())
+
+    def test_matrix_encoder_distills_without_physical_inputs(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from gnn_amg.factor_replay import fit_matrix_encoder
+        from gnn_amg.factorized import DEPTHS, PHYSICAL_COLUMNS, first_graph
+        from gnn_amg.live import load_live_factor
+
+        rng = np.random.default_rng(19)
+        width = 4
+        sizes = layer_sizes(width)
+        count = sum((i+1)*o for i,o in sizes)
+        teacher = FactorModel(width,rng.normal(size=count),np.zeros((STAGES,REGIONS,6)),
+                              coefficient_weights=rng.normal(size=(2,count)))
+        x = rng.normal(size=(256,sizes[0][0]))
+        keep = np.setdiff1d(np.arange(x.shape[1]), PHYSICAL_COLUMNS)
+        x[:,PHYSICAL_COLUMNS] = x[:,keep]@rng.normal(size=(len(keep),len(PHYSICAL_COLUMNS))) + .1
+        augmented = np.column_stack((x,np.ones(len(x))))
+        moment = augmented.T@augmented/len(x)
+        student = fit_matrix_encoder(teacher,np.repeat(moment[None],STAGES,axis=0),1e-8)
+        reduced = x.copy()
+        reduced[:,PHYSICAL_COLUMNS] = 0.
+        for source,target in ((teacher,student),
+                              *((teacher.coefficients_at(i),student.coefficients_at(i))
+                                for i in (0,DEPTHS[0]))):
+            np.testing.assert_allclose(source.linear(0,x),target.linear(0,reduced),rtol=1e-6,atol=1e-5)
+            self.assertTrue(target.matrix_only)
+            self.assertFalse(np.any(target.layers[0][0][:,PHYSICAL_COLUMNS]))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = save_model(root/"matrix.npz",student)
+            np.testing.assert_array_equal(load_live_factor({"factor_model":receipt}).weights,student.weights)
+            full = save_model(root/"teacher.npz",teacher)
+            with self.assertRaisesRegex(ValueError,"matrix-only checkpoint"):
+                load_live_factor({"factor_model":full})
+        layout = dict(ownership=[0,3],native_node=np.array([0,1,1]),component=np.array([2,0,1]),
+                      xyz=np.array([[0.,0.,0.],[2.,4.,0.]]))
+        fields = {"constrained":np.array([False,False,True,False,False,False])}
+        with patch("gnn_amg.factorized.matrix_graph") as build:
+            _,attrs,coordinates = first_graph(SimpleNamespace(rank=0),None,None,layout,fields,matrix_only=True)
+            np.testing.assert_array_equal(attrs[:,-3:],coordinates[layout["native_node"]])
+            np.testing.assert_array_equal(build.call_args.args[5],[True,False,False])
+            self.assertFalse(np.any(attrs[:,:-3]))
+
+    def test_embedded_geometry_candidates_match_public_scipy(self):
+        from gnn_amg.student import geometry_candidates, geometry_tree
+
+        rng = np.random.default_rng(36)
+        fine = rng.integers(-2, 3, (52, 3)).astype(float)
+        coarse = np.repeat(fine[::5], 2, axis=0)
+        fine_comp = np.arange(len(fine))%3
+        coarse_comp = np.arange(len(coarse))%2
+        free = np.arange(len(fine))%4 != 0
+        inputs = (fine, coarse, fine_comp, coarse_comp, free, 12)
+        embedded = geometry_candidates(*inputs, tree_type=geometry_tree(embedded=True))
+        public = geometry_candidates(*inputs)
+        for actual,expected in zip(embedded,public):
+            np.testing.assert_array_equal(actual,expected)
+
     def test_hard_selection_and_signed_weights(self):
         scores = np.array([[0., 3., 5., 2.], [0., 0., 0., 0.]])
         valid = np.array([[True, True, False, True], [False, False, False, False]])

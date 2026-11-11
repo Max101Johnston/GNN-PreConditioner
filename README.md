@@ -305,6 +305,19 @@ the production HYPRE options and uses the same full-system GMRES tolerances,
 true-residual checks and output schedule as the learned hierarchy. PETSc
 reports the instantiated displacement PC before the first solve.
 
+The `factorized` live method uses the current displacement matrix, the
+verified mesh coordinates, and the constraint mask. Set `factor_model` to
+a matrix-only checkpoint receipt. The hook runs inside the existing OGS
+executable and reports hierarchy construction, linear solve, and total
+elapsed time.
+
+`student_cycle=factor_input` distills the original encoder into these
+inputs using archived training states. The new checkpoint has zero weights
+on the omitted physical channels. Actual displacement cycles refine the
+two coefficient encoders on the archived probes. Four independent frames
+select the checkpoint by true residual and paired total time, followed by
+the fixed eight validation frames for a qualifying candidate.
+
 For timing studies, set `live.output_profile` to `lean` for every method in
 the same comparison. It requests the five primary variables and checks that
 the output index contains only the start, the optional injection boundary,
@@ -524,3 +537,14 @@ Both variants use the same probe archive, update schedule
 and independent diagnostic frames. The fixed eight-frame comparison runs
 only after the attention variant passes both diagnostic timing repeats.
 The test split is reserved for the frozen evaluation.
+
+`student_cycle=factor_attention_point` reproduces the failed level-two
+attention direction on the original fixed frame and probes. It records
+matched FP64 pooling and coefficient slopes, production ReLU and clip
+crossings, and one-sided slopes of the fixed-support Galerkin operator.
+It also checks the field projection against the frame's archived
+inputs. This diagnostic uses the recorded per-frame MPI size.
+The limited attention run can reuse the archived audit and point diagnosis
+via `factor_attention.audit_resume`. The original tolerance applies to two
+adjacent slopes on the branch used by the analytic gradient. The measured
+crossing on the other side must account for the corresponding slope change.

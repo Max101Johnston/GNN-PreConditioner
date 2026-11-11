@@ -20,8 +20,17 @@ from gnn_amg.student import load_student
 def method_names(settings):
     names = tuple(settings.get("methods", ("reference", "student")))
     assert names and len(set(names)) == len(names)
-    assert set(names) <= {"reference", "student", "amg"}
+    assert set(names) <= {"reference", "student", "amg", "factorized"}
     return names
+
+
+def load_live_factor(config):
+    from gnn_amg.factorized import load_model
+
+    model = load_model(config["factor_model"])
+    if not model.matrix_only:
+        raise ValueError("The existing OGS image requires a matrix-only checkpoint")
+    return model
 
 
 def lean_times(settings):
@@ -61,6 +70,9 @@ def prepare(config_path, directory):
     """Freeze the original loading inputs and rebuild the RAS overlap at source rank count."""
     config = read_json(config_path)
     settings = config["live"]
+    methods = method_names(settings)
+    if "factorized" in methods:
+        load_live_factor(config)
     source = Path(settings["source_case"])
     receipt_path = source / "records/loading-inputs.json"
     assert digest(receipt_path) == settings["loading_receipt_sha256"]
@@ -94,7 +106,6 @@ def prepare(config_path, directory):
     assert output_profile in ("production", "lean")
     if output_profile == "lean":
         raw = lean_output(raw, settings)
-    methods = method_names(settings)
     amg_option = "-th2m_fieldsplit_1_pc_type hypre"
     assert raw.count(amg_option) == 1
     projects = {}
@@ -141,12 +152,65 @@ def prepare(config_path, directory):
     with (directory / "input-identity.json").open("x") as f:
         json.dump(dict(project=prepared_project["path"], project_sha256=prepared_project["sha256"], projects=projects,
             input_files=len(receipt["files"]), source_loading_job=receipt["job_id"],
-            output_profile=output_profile,
+            output_profile=output_profile, loading_image_sha256=receipt["image_sha256"],
+            runtime_image_sha256=config["image_sha256"], factor_model=config.get("factor_model"),
             consolidated_sha256=receipt["source"]["sha256"],
             consolidated_time_s=receipt["source"]["final_frame"]["time"],
             mask_frames=len(rows), constrained=int(fixed.sum()),
             layout=read_json(directory / "records" / ("layout-%s.json" % source.name))), f, indent=2)
     print("LIVE_OGS_INPUTS_VERIFIED", prepared_project["path"], flush=True)
+
+
+
+def project_linearization(fracture, include, local, incident, aperture_projection):
+    """Apply the snapshot pipeline's incident means and Hex8 aperture map."""
+    mean = fracture.mean(1)
+    values = np.broadcast_to(mean[:, None, :], fracture.shape)[include]
+    features = np.column_stack([
+        np.bincount(local, weights=values[:, k], minlength=len(incident))
+        for k in range(fracture.shape[-1])]) / incident[:, None]
+    aperture = fracture[:, :, 8] @ aperture_projection
+    aperture = np.bincount(local, weights=aperture[include], minlength=len(incident)) / incident
+    return features, aperture
+
+
+def verify_archived_fields(p, config, legacy, replay, row, layout, fields):
+    """Reproduce the archived projection on a verified, unmodified snapshot."""
+    folder = Path(row["directory"])
+    manifest = folder / "manifest.json"
+    if digest(manifest) != row["manifest_sha256"]:
+        raise ValueError("The field parity snapshot changed")
+    files = {f["path"]: f for f in read_json(manifest)["files"]}
+    if p.rank == 0:
+        phase = folder / "physical_1.bin"
+        if digest(phase, "sha1") != files[phase.name]["sha1"]:
+            raise ValueError("The archived phase vector changed")
+        phi = replay.read_vector(phase, len(layout["xyz"]))[layout["phase_rows"]]
+        np.testing.assert_array_equal(phi, fields["phi"])
+    cache = Path(config["baseline_directory"]) / "cache" / row["case"]
+    projection = np.linalg.pinv(legacy.shape_matrix()).T
+    nodes, ranks = 0, 0
+    for rank in range(p.rank, row["source_ranks"], p.size):
+        state = json.loads(legacy.checked_bytes(folder, "state_rank_%d.json" % rank, files))
+        with np.load(cache / ("rank-%03d.npz" % rank)) as data:
+            if (str(data["layout_sha1"]) != state["static_layout_sha1"]
+                    or state["state_stage"] != "same Newton linearization, before update"
+                    or state["fracture_components"] != 20):
+                raise ValueError("The archived field and layout receipts differ")
+            owned, cells, include, local, incident = (
+                data[k] for k in ("owned", "cells", "include", "local", "incident"))
+        fracture = np.asarray([e["fracture"] for e in state["elements"]], dtype=np.float64)
+        features, aperture = project_linearization(fracture.reshape(len(cells), 8, 20),
+                                                      include, local, incident, projection)
+        np.testing.assert_array_equal(features, fields["features"][owned])
+        np.testing.assert_array_equal(aperture, fields["aperture"][owned])
+        nodes += len(owned)
+        ranks += 1
+    nodes, ranks = map(int, p.reduce([nodes, ranks]))
+    if (nodes, ranks) != (len(layout["xyz"]), row["source_ranks"]):
+        raise ValueError("The archived field parity check missed part of the mesh")
+    return dict(snapshot=row["key"], manifest=row["manifest_sha256"], nodes=nodes,
+                physical_ranks=ranks, exact=True)
 
 
 class LivePC:
@@ -161,14 +225,16 @@ class LivePC:
         self.replay.pcapply_bind(p)
         self.bridge = load_bridge(p, config["bridge"])
         with np.load(self.cache / "layout.npz") as f:
-            self.layout = {name: f[name] for name in ("full_rows", "native_node", "component", "ownership")}
+            self.layout = {name: f[name] for name in ("full_rows", "native_node", "component", "ownership", "xyz")}
         self.fields = dict(constrained=np.load(directory / "constrained.npy", allow_pickle=False))
         self.lo, self.hi = map(int, self.layout["ownership"][p.rank:p.rank+2])
         self.rows = self.layout["full_rows"][self.lo:self.hi]
         native = (3*self.layout["native_node"] + self.layout["component"])[self.lo:self.hi]
         self.fixed = self.fields["constrained"][native]
         self.context = dict(policy="prior_only", fast_prior=True, p1_refinement_sweeps=2)
-        if method == "student":
+        if method == "factorized":
+            self.context = dict(factor_model=load_live_factor(config), factor_fusion=True)
+        elif method == "student":
             frozen = settings["student"]
             for level, model in frozen["students"].items():
                 load_student(model["path"], model["sha256"], int(level[1:]))
@@ -247,14 +313,17 @@ class LivePC:
         if p.maximum(float(np.any(self.fixed != diagonal_only))):
             raise ValueError("Live unit diagonal constraint rows differ from the verified source mask")
         self.times.clear()
+        hierarchy_timing = {}
         if use_amg:
             kind = C.c_char_p()
             p.call("PCHYPREGetType", original, C.byref(kind))
             assert kind.value == b"boomeramg", kind.value
             hierarchy = dict(pc_type="hypre", amg_type=kind.value.decode(), displacement=None)
         else:
+            begin_hierarchy = time.perf_counter()
             displacement = prepare_displacement(self.config, p, self.legacy, self.bridge, None,
                 k, self.layout, self.fields, self.cache, context=self.context)
+            hierarchy_timing["hierarchy_s"] = p.maximum(time.perf_counter()-begin_hierarchy)
             if displacement.failure is not None:
                 raise ValueError("Live hierarchy failed: " + displacement.failure)
             p.call("PetscObjectReference", original)
@@ -264,7 +333,7 @@ class LivePC:
         build, work = p.vector(full), p.vector(full)
         true_limit = max(atol.value, rtol.value*p.norm(rhs))
         self.active = dict(full=full, rhs=rhs, build=build, work=work, limit=true_limit,
-                           start=start, cap=cap.value, **hierarchy)
+                           start=start, cap=cap.value, hierarchy_timing=hierarchy_timing, **hierarchy)
         p.call("KSPSetConvergenceTest", ksp, C.cast(self.convergence, p.P), None, None)
         p.call("KSPSetUp", ksp)
         p.call("KSPSetUpOnBlocks", ksp)
@@ -305,7 +374,8 @@ class LivePC:
             payload = json.dumps(dict(method=self.method, solve=self.solve_count,
                 iterations=iterations.value, reason=reason.value, residual=residual,
                 true_limit=state["limit"], elapsed_s=elapsed, setup_s=state["setup_s"],
-                pc_type=state["pc_type"], amg_type=state["amg_type"], **hierarchy), allow_nan=False)
+                pc_type=state["pc_type"], amg_type=state["amg_type"],
+                **state["hierarchy_timing"], **hierarchy), allow_nan=False)
             with self.solve_log.open("a") as log:
                 log.write(payload + "\n")
             print("LIVE_OGS_SOLVE", payload, flush=True)
@@ -364,8 +434,11 @@ def verify(config_path, directory):
             pc_type=solves[0]["pc_type"], amg_type=solves[0]["amg_type"],
             output=str(result), final_pvtu=str(pvtu))
         if method != "amg":
-            for key in ("p1_nnz", "k1_nnz", "p2_nnz"):
+            for key in ("p1_nnz", "k1_nnz", "p2_nnz", "hierarchy_s"):
                 methods[method][key] = sum(row[key] for row in solves)
+        if method == "factorized":
+            methods[method]["model"] = config["factor_model"]
+            methods[method]["inputs"] = ["displacement_matrix", "coordinates", "constraints"]
         start = settings.get("injection_start_s")
         if start is not None:
             timed = [(row, solve) for row, solve in zip(native, solves) if row["t"] > start]
